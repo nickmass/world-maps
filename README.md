@@ -7,3 +7,5 @@ In order to run the program you will need to acquire a mbtiles file, you can fin
 ```
 $ cargo run --release -- --style mapbox_style.json tile_data.mbtiles
 ```
+
+![World Maps Demo](assets/demo.png)
