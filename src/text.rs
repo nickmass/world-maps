@@ -1,4 +1,4 @@
-use fontdue::Font;
+use fontdue::{Font, Metrics};
 
 use std::{
     collections::HashMap,
@@ -15,6 +15,7 @@ pub struct GlyphRender {
     pub atlas_size: V2<u32>,
     pub state: Arc<Mutex<GlyphRenderState>>,
     pub fonts: FontCollection,
+    pub glyph_upload: Arc<RwLock<HashMap<GlyphKey, GlyphUploadEntry>>>,
 }
 
 pub struct GlyphRenderState {
@@ -32,78 +33,30 @@ impl Default for GlyphRenderState {
 }
 
 impl GlyphRender {
-    pub fn prepare(&mut self, queue: &wgpu::Queue, text_size: f32, glyph_id: GlyphId) {
-        if self
-            .atlas_contents
-            .read()
-            .unwrap()
-            .contains_key(&glyph_id.with_size(text_size))
-            || glyph_id.1 == ' '
-        {
+    pub fn prepare(&mut self, text_size: f32, glyph_id: GlyphId) {
+        let glyph_key = glyph_id.with_size(text_size);
+
+        if glyph_id.1 == ' ' || self.atlas_contents.read().unwrap().contains_key(&glyph_key) {
             return;
         }
 
-        let mut atlas = self.atlas_contents.write().unwrap();
-
-        let mut state = self.state.lock().unwrap();
+        {
+            let mut upload = self.glyph_upload.write().unwrap();
+            if upload.contains_key(&glyph_key) {
+                return;
+            } else {
+                upload.insert(glyph_key, GlyphUploadEntry::Pending);
+            }
+        }
 
         let GlyphId(font_id, glyph) = glyph_id;
 
         let font = self.fonts.font_id(font_id);
         let (metrics, bitmap) = font.rasterize(glyph, text_size);
-        let width = metrics.width as u32;
-        let height = metrics.height as u32;
 
-        if state.cursor.x + width >= self.atlas_size.x {
-            state.cursor.y += state.row_height + 1;
-            state.cursor.x = 0;
-            state.row_height = 0;
-        }
-
-        state.row_height = state.row_height.max(height);
-
-        if state.cursor.y + height >= self.atlas_size.y {
-            eprintln!("ATLAS FULL");
-            self.atlas_contents.write().unwrap().clear();
-            state.cursor = V2::zero();
-            return;
-        }
-
-        if let Some(bytes) = std::num::NonZeroU32::new(width) {
-            queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &self.atlas_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: state.cursor.x,
-                        y: state.cursor.y,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                bitmap.as_slice(),
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-
-            let entry = AtlasEntry {
-                offset: state.cursor,
-                dimensions: V2::new(width, height),
-            };
-
-            atlas.insert(glyph_id.with_size(text_size), entry);
-
-            state.cursor.x += width + 1;
-        } else {
-            eprintln!("err");
+        {
+            let mut upload = self.glyph_upload.write().unwrap();
+            upload.insert(glyph_key, GlyphUploadEntry::Prepared(metrics, bitmap));
         }
     }
 }
@@ -169,9 +122,14 @@ impl FontCollection {
     }
 }
 
+pub enum GlyphUploadEntry {
+    Pending,
+    Prepared(Metrics, Vec<u8>),
+}
+
 pub struct AtlasEntry {
-    offset: V2<u32>,
-    dimensions: V2<u32>,
+    pub offset: V2<u32>,
+    pub dimensions: V2<u32>,
 }
 
 impl AtlasEntry {

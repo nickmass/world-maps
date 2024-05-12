@@ -8,16 +8,20 @@ use std::{
 
 use math::{Rect, V2, V4};
 
-use crate::text::{AtlasEntry, GlyphKey, GlyphRender, GlyphRenderState, TEXT_ATLAS_SIZE};
+use crate::text::{
+    AtlasEntry, GlyphKey, GlyphRender, GlyphRenderState, GlyphUploadEntry, TEXT_ATLAS_SIZE,
+};
 use crate::{FeatureDraw, LayerLabelDraw, RectExt, TileId};
 
 pub const TILE_WGSL: &'static str = include_str!("../shaders/tile.wgsl");
 pub const TEXT_WGSL: &'static str = include_str!("../shaders/text.wgsl");
+pub const PUSH_CONSTANT_LIMIT: usize = 128;
 
 pub struct Gfx {
-    surface: wgpu::Surface,
+    window: &'static Window,
+    surface: wgpu::Surface<'static>,
     device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
+    queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
     multisampled_framebuffer: wgpu::TextureView,
@@ -30,14 +34,16 @@ pub struct Gfx {
 }
 
 impl Gfx {
-    pub fn new(window: &Window, tile_size: u32) -> Self {
+    pub fn new(window: &'static Window, tile_size: u32) -> Self {
         let size = window.inner_size();
         let size = V2::new(size.width, size.height);
         let tile_size = V2::fill(tile_size).as_f32();
         let samples = 4;
 
-        let instance = wgpu::Instance::new(wgpu::Backends::VULKAN);
-        let surface = unsafe { instance.create_surface(window) };
+        let instance_desc = wgpu::InstanceDescriptor::default();
+
+        let instance = wgpu::Instance::new(instance_desc);
+        let surface = instance.create_surface(window).unwrap();
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
@@ -47,9 +53,9 @@ impl Gfx {
 
         let device_request = adapter.request_device(
             &wgpu::DeviceDescriptor {
-                features: wgpu::Features::PUSH_CONSTANTS,
-                limits: wgpu::Limits {
-                    max_push_constant_size: 128,
+                required_features: wgpu::Features::PUSH_CONSTANTS,
+                required_limits: wgpu::Limits {
+                    max_push_constant_size: PUSH_CONSTANT_LIMIT as u32,
                     ..Default::default()
                 },
                 label: Some("device"),
@@ -59,14 +65,11 @@ impl Gfx {
 
         let (device, queue) = pollster::block_on(device_request).unwrap();
 
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface.get_supported_formats(&adapter)[0],
-            width: size.x,
-            height: size.y,
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
-        };
+        let mut config = surface
+            .get_default_config(&adapter, size.x, size.y)
+            .unwrap();
+        config.present_mode = wgpu::PresentMode::AutoVsync;
+
         surface.configure(&device, &config);
 
         let glyph_renderer = GlyphPipeline::new(&device, &config, samples);
@@ -82,7 +85,7 @@ impl Gfx {
                 bind_group_layouts: &[],
                 push_constant_ranges: &[wgpu::PushConstantRange {
                     stages: wgpu::ShaderStages::VERTEX,
-                    range: 0..128,
+                    range: 0..PUSH_CONSTANT_LIMIT as u32,
                 }],
             });
 
@@ -93,6 +96,7 @@ impl Gfx {
                 module: &shader,
                 entry_point: "vs_main",
                 buffers: &[GeoVertex::desc()],
+                compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -102,6 +106,7 @@ impl Gfx {
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+                compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -125,10 +130,11 @@ impl Gfx {
             Self::create_multisampled_framebuffer(&device, &config, samples);
 
         Self {
+            window,
             instance,
             surface,
             device: Arc::new(device),
-            queue: Arc::new(queue),
+            queue,
             config,
             render_pipeline,
             multisampled_framebuffer,
@@ -150,7 +156,8 @@ impl Gfx {
             height: config.height,
             depth_or_array_layers: 1,
         };
-        let multisampled_frame_descriptor = &wgpu::TextureDescriptor {
+        let view_formats = vec![config.format];
+        let multisampled_frame_descriptor = wgpu::TextureDescriptor {
             size: multisampled_texture_extent,
             mip_level_count: 1,
             sample_count,
@@ -158,23 +165,27 @@ impl Gfx {
             format: config.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             label: None,
+            view_formats: &view_formats,
         };
 
         device
-            .create_texture(multisampled_frame_descriptor)
+            .create_texture(&multisampled_frame_descriptor)
             .create_view(&wgpu::TextureViewDescriptor::default())
     }
 
     pub fn handle(&self) -> GfxHandle {
         GfxHandle {
             device: self.device.clone(),
-            queue: self.queue.clone(),
             glyph_render: self.glyph_pipeline.glyph_render(),
         }
     }
 
     pub fn store_tile(&mut self, tile_geo: TileGeometry) {
         if self.tile_cache.contains(tile_geo.tile_id) {
+            return;
+        }
+
+        if !tile_geo.text.complete {
             return;
         }
 
@@ -192,9 +203,8 @@ impl Gfx {
         }
     }
 
-    pub fn reconfigure(&mut self, window: &Window) {
-        println!("reconfig");
-        self.surface = unsafe { self.instance.create_surface(window) };
+    pub fn reconfigure(&mut self) {
+        self.surface = self.instance.create_surface(self.window).unwrap();
         self.surface.configure(&self.device, &self.config);
         self.multisampled_framebuffer =
             Self::create_multisampled_framebuffer(&self.device, &self.config, self.samples);
@@ -233,10 +243,12 @@ impl Gfx {
                             b: 0.79 as f64,
                             a: 1.0,
                         }),
-                        store: true,
+                        store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
             });
             render_pass.set_pipeline(&self.render_pipeline);
 
@@ -277,9 +289,11 @@ impl Gfx {
             }
         }
 
+        self.glyph_pipeline.upload(&self.queue);
         self.render_text(&mut encoder, &view, tiles, zoom, scale);
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.submit(Some(encoder.finish()));
+
         output.present();
 
         Ok(())
@@ -300,10 +314,12 @@ impl Gfx {
                 resolve_target: Some(&view),
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
-                    store: true,
+                    store: wgpu::StoreOp::Store,
                 },
             })],
             depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
         });
 
         text_pass.set_pipeline(&self.glyph_pipeline.render_pipeline);
@@ -318,6 +334,7 @@ impl Gfx {
             } else {
                 continue;
             };
+
             text_pass.insert_debug_marker("new tile");
             text_pass.set_vertex_buffer(0, tile.text.vertex_buffer.slice(..));
             text_pass.set_index_buffer(tile.text.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -368,7 +385,6 @@ impl Gfx {
 pub struct GfxHandle {
     device: Arc<wgpu::Device>,
     glyph_render: GlyphRender,
-    queue: Arc<wgpu::Queue>,
 }
 
 impl GfxHandle {
@@ -399,8 +415,7 @@ impl GfxHandle {
         for layer in labels.iter() {
             for label in layer.labels.iter() {
                 for glyph in label.glyphs() {
-                    self.glyph_render
-                        .prepare(&self.queue, label.text_size, glyph.glyph)
+                    self.glyph_render.prepare(label.text_size, glyph.glyph)
                 }
             }
         }
@@ -421,6 +436,7 @@ impl GfxHandle {
         let mut indices: Vec<u32> = Vec::new();
         let mut layers = Vec::new();
         let mut labels = Vec::new();
+        let mut complete = true;
 
         {
             let cache = self.glyph_render.atlas_contents.read().unwrap();
@@ -483,6 +499,10 @@ impl GfxHandle {
                                 indices.push(idx + 1);
                                 indices.push(idx + 2);
                                 indices.push(idx + 3);
+                            }
+                        } else {
+                            if glyph.glyph.1 != ' ' {
+                                complete = false;
                             }
                         }
                     }
@@ -576,6 +596,7 @@ impl GfxHandle {
             vertex_buffer,
             index_buffer,
             layers,
+            complete,
         }
     }
 }
@@ -595,6 +616,7 @@ struct GlyphPipeline {
     atlas_size: V2<u32>,
     atlas_contents: Arc<RwLock<HashMap<GlyphKey, AtlasEntry>>>,
     state: Arc<Mutex<GlyphRenderState>>,
+    glyph_upload: Arc<RwLock<HashMap<GlyphKey, GlyphUploadEntry>>>,
 }
 
 impl GlyphPipeline {
@@ -612,6 +634,7 @@ impl GlyphPipeline {
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::R8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         });
 
         let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -620,9 +643,9 @@ impl GlyphPipeline {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -675,7 +698,7 @@ impl GlyphPipeline {
                 bind_group_layouts: &[&atlas_bind_group_layout],
                 push_constant_ranges: &[wgpu::PushConstantRange {
                     stages: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    range: 0..128,
+                    range: 0..PUSH_CONSTANT_LIMIT as u32,
                 }],
             });
 
@@ -686,6 +709,7 @@ impl GlyphPipeline {
                 module: &shader,
                 entry_point: "vs_main",
                 buffers: &[TextVertex::desc()],
+                compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -695,6 +719,7 @@ impl GlyphPipeline {
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+                compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -721,6 +746,7 @@ impl GlyphPipeline {
             render_pipeline,
             atlas_contents: Arc::new(RwLock::new(HashMap::new())),
             state: Arc::new(Mutex::new(GlyphRenderState::default())),
+            glyph_upload: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -731,7 +757,79 @@ impl GlyphPipeline {
             atlas_contents: self.atlas_contents.clone(),
             fonts: crate::FontCollection::new(),
             state: self.state.clone(),
+            glyph_upload: self.glyph_upload.clone(),
         }
+    }
+
+    fn upload(&self, queue: &wgpu::Queue) {
+        let mut upload = self.glyph_upload.write().unwrap();
+        let mut atlas_contents = self.atlas_contents.write().unwrap();
+        let mut atlas_state = self.state.lock().unwrap();
+
+        let mut pending_set = HashMap::new();
+
+        for (glyph_key, entry) in upload.drain() {
+            if let GlyphUploadEntry::Prepared(metrics, bitmap) = entry {
+                if atlas_contents.contains_key(&glyph_key) {
+                    continue;
+                }
+
+                let width = metrics.width as u32;
+                let height = metrics.height as u32;
+
+                if atlas_state.cursor.x + width >= self.atlas_size.x {
+                    atlas_state.cursor.y += atlas_state.row_height + 1;
+                    atlas_state.cursor.x = 0;
+                    atlas_state.row_height = 0;
+                }
+
+                atlas_state.row_height = atlas_state.row_height.max(height);
+
+                if atlas_state.cursor.y + height >= self.atlas_size.y {
+                    eprintln!("ATLAS FULL");
+                    atlas_contents.clear();
+                    atlas_state.cursor = V2::zero();
+                    continue;
+                }
+
+                queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.atlas_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: atlas_state.cursor.x,
+                            y: atlas_state.cursor.y,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    bitmap.as_slice(),
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(width),
+                        rows_per_image: None,
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+
+                let entry = AtlasEntry {
+                    offset: atlas_state.cursor,
+                    dimensions: V2::new(width, height),
+                };
+
+                atlas_contents.insert(glyph_key, entry);
+
+                atlas_state.cursor.x += width + 1;
+            } else {
+                pending_set.insert(glyph_key, entry);
+            }
+        }
+
+        upload.extend(pending_set.drain());
     }
 }
 
@@ -739,6 +837,7 @@ pub struct TextBuffers {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     layers: Vec<LabelLayerGeometry>,
+    complete: bool,
 }
 
 pub struct GpuTileCache<T> {
@@ -825,6 +924,11 @@ struct TileUniforms {
     fill_color: V4<f32>,
     line_color: V4<f32>,
 }
+
+const _: () = assert!(
+    std::mem::size_of::<TileUniforms>() <= PUSH_CONSTANT_LIMIT,
+    "TileUniforms must fit within push constant limit"
+);
 
 impl TileUniforms {
     fn new(window_size: V2<u32>, scale: f32, rect: Rect<i32>, style: super::FeatureStyle) -> Self {

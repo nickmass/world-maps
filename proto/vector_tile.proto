@@ -16,7 +16,7 @@ message Tile {
         // The use of values is described in section 4.1 of the specification
         message Value {
                 // Exactly one of these values must be present in a valid message
-                optional string string_value = 1;
+                optional bytes string_value = 1;
                 optional float float_value = 2;
                 optional double double_value = 3;
                 optional int64 int_value = 4;

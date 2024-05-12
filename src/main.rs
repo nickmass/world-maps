@@ -1,3 +1,4 @@
+use bstr::ByteSlice;
 use clap::Parser;
 use libflate::gzip;
 use lyon::{
@@ -12,18 +13,20 @@ use proto::{tile::GeomType, Tile};
 use rusqlite::{Connection, OptionalExtension};
 use smallvec::SmallVec;
 use winit::{
-    event::{Event, MouseButton, WindowEvent},
-    event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
+    event::{MouseButton, WindowEvent},
+    event_loop::{EventLoop, EventLoopProxy},
+    window::Window,
 };
 
 use math::{Rect, V2, V4};
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     io::Read,
     path::Path,
     sync::{atomic::AtomicUsize, mpsc, Arc, Mutex},
     thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use crate::gfx::GeoVertex;
@@ -36,7 +39,7 @@ mod proto {
 mod style;
 mod text;
 
-const TILE_SIZE: u32 = 512;
+const TILE_SIZE: u32 = 256;
 const LINE_WIDTH_SCALE: f32 = 1.0 / TILE_SIZE as f32;
 
 /// Navigate OSM MBTiles tilesets
@@ -51,178 +54,282 @@ struct Args {
 }
 
 fn main() {
-    let args = Args::parse();
-    let style_json = std::fs::File::open(&args.style).unwrap();
-    let style: style::Style = serde_json::from_reader(style_json).unwrap();
+    env_logger::init();
+    let event_loop: EventLoop<UserEvent> = EventLoop::with_user_event().build().unwrap();
+    let proxy = event_loop.create_proxy();
+    let mut application = Application::new(proxy);
 
-    let event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
-    let window_builder = winit::window::WindowBuilder::new()
-        .with_title("World Map")
-        .with_inner_size(winit::dpi::PhysicalSize {
-            width: 1920 * 2,
-            height: 1080 * 2,
-        });
+    event_loop.run_app(&mut application).unwrap();
+}
 
-    let window = window_builder.build(&event_loop).unwrap();
-    let mut wgfx = gfx::Gfx::new(&window, TILE_SIZE);
+struct Application {
+    event_loop_proxy: EventLoopProxy<UserEvent>,
+    state: Option<ApplicationState>,
+}
 
-    let mut input_state = InputState::new();
+impl Application {
+    fn new(event_loop_proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self {
+            event_loop_proxy,
+            state: None,
+        }
+    }
+}
 
-    let mut slippy = SlippyMap::new(
-        V2::new(TILE_SIZE, TILE_SIZE).as_f64(),
-        V2::new(1920 * 2, 1080 * 2),
-        Camera {
-            zoom: 13.0,
-            position: V2::new(53.5461853, -113.5083185),
-        },
-    );
+impl winit::application::ApplicationHandler<UserEvent> for Application {
+    fn resumed(&mut self, active_event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.state.is_none() {
+            let state = ApplicationState::new(self.event_loop_proxy.clone(), active_event_loop);
 
-    let mut target_zoom = slippy.current_zoom();
-
-    let (tile_loader, tile_handle) = TileLoader::new(&args, style, &wgfx);
-
-    let _t = std::thread::Builder::new()
-        .name("tile-dispatch".into())
-        .spawn({
-            let proxy = event_loop.create_proxy();
-            move || {
-                tile_handle.process_tiles(proxy);
-            }
-        });
-
-    for tile in slippy.nearby_tiles(slippy.current_zoom() + 1.0) {
-        tile_loader.prepare_tile(tile);
+            self.state = Some(state);
+        }
     }
 
-    for tile in slippy.nearby_tiles(slippy.current_zoom() - 1.0) {
-        tile_loader.prepare_tile(tile);
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if let Some(state) = self.state.as_mut() {
+            state.window_event(event_loop, window_id, event);
+        }
     }
 
-    let mut frame_times = std::collections::VecDeque::new();
-    let mut frame_time = std::time::Instant::now();
-
-    event_loop.run(move |event, _window, control_flow| match event {
-        Event::WindowEvent {
-            event: WindowEvent::CloseRequested,
-            ..
-        } => *control_flow = ControlFlow::Exit,
-        Event::WindowEvent {
-            event: WindowEvent::Resized(size),
-            ..
-        } => {
-            let size = V2::new(size.width, size.height);
-            wgfx.resize(size);
-            slippy.resize(size);
-            window.request_redraw();
+    fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
+        if let Some(state) = self.state.as_mut() {
+            state.user_event(event_loop, event);
         }
-        Event::WindowEvent {
-            event: WindowEvent::ScaleFactorChanged { new_inner_size, .. },
-            ..
-        } => {
-            let size = V2::new(new_inner_size.width, new_inner_size.height);
-            wgfx.resize(size);
-            slippy.resize(size);
-            window.request_redraw();
-        }
-        Event::UserEvent(UserEvent::TilePrepared(tile)) => {
-            wgfx.store_tile(tile);
-            window.request_redraw();
-        }
-        Event::RedrawRequested(_) => {
-            let r = wgfx.render(
-                slippy.screen_tiles(),
-                slippy.current_zoom() as f32,
-                slippy.scale() as f32,
-            );
+    }
+}
 
-            frame_times.push_back(frame_time.elapsed());
-            frame_time = std::time::Instant::now();
+struct GfxWindow {
+    // Safety: must drop gfx before window
+    gfx: gfx::Gfx,
+    window: Box<Window>,
+}
 
-            if frame_times.len() > 10 {
-                let _ = frame_times.pop_front();
-                let avg = frame_times
-                    .iter()
-                    .sum::<std::time::Duration>()
-                    .as_secs_f64()
-                    / frame_times.len() as f64;
-                let fps = 1.0 / avg;
-                let max = frame_times.iter().max().unwrap().as_secs_f64() * 1000.0;
-                println!("{:.1}fps {:.1}avg {:.1}max", fps, avg * 1000.0, max);
-            }
+impl GfxWindow {
+    fn new(window: Window) -> Self {
+        let window = Box::new(window);
+        let window_ref = unsafe { std::mem::transmute(window.as_ref()) };
+        let gfx = gfx::Gfx::new(window_ref, TILE_SIZE);
 
-            if let Err(e) = r {
-                eprintln!("{:?}", e);
-                if e == wgpu::SurfaceError::Outdated {
-                    wgfx.reconfigure(&window);
+        Self { gfx, window }
+    }
+
+    fn gfx(&mut self) -> &mut gfx::Gfx {
+        &mut self.gfx
+    }
+
+    fn window(&mut self) -> &Window {
+        &self.window
+    }
+
+    fn request_redraw(&self) {
+        self.window.request_redraw()
+    }
+}
+
+struct ApplicationState {
+    window: GfxWindow,
+    input_state: InputState,
+    slippy: SlippyMap,
+    tile_loader: TileLoader,
+    target_zoom: f64,
+    frame_times: VecDeque<Duration>,
+    frame_time: Instant,
+}
+
+impl ApplicationState {
+    fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        active_event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> Self {
+        let args = Args::parse();
+        let style_json = std::fs::File::open(&args.style).unwrap();
+        let style: style::Style = serde_json::from_reader(style_json).unwrap();
+
+        let window = active_event_loop
+            .create_window(
+                Window::default_attributes()
+                    .with_title("World Map")
+                    .with_inner_size(winit::dpi::PhysicalSize {
+                        width: 1920 * 2,
+                        height: 1080 * 2,
+                    }),
+            )
+            .unwrap();
+
+        let mut window = GfxWindow::new(window);
+
+        let input_state = InputState::new();
+
+        let slippy = SlippyMap::new(
+            V2::new(TILE_SIZE, TILE_SIZE).as_f64(),
+            V2::new(1920 * 2, 1080 * 2),
+            Camera {
+                zoom: 13.0,
+                position: V2::new(53.5461853, -113.5083185),
+            },
+        );
+
+        let (tile_loader, tile_handle) = TileLoader::new(&args, style, window.gfx());
+        let _t = std::thread::Builder::new()
+            .name("tile-dispatch".into())
+            .spawn({
+                move || {
+                    tile_handle.process_tiles(proxy);
                 }
-            }
+            });
+        for tile in slippy.nearby_tiles(slippy.current_zoom() + 1.0) {
+            tile_loader.prepare_tile(tile);
         }
-        Event::WindowEvent {
-            event: WindowEvent::MouseInput { state, button, .. },
-            ..
-        } => {
-            let pressed = state == winit::event::ElementState::Pressed;
-            input_state.set_mouse_button(button, pressed);
+
+        for tile in slippy.nearby_tiles(slippy.current_zoom() - 1.0) {
+            tile_loader.prepare_tile(tile);
         }
-        Event::WindowEvent {
-            event: WindowEvent::CursorMoved { position, .. },
-            ..
-        } => {
-            let delta = input_state.set_mouse_position(V2::new(position.x, position.y));
 
-            if input_state.get_mouse_button(MouseButton::Left) {
-                slippy.pan(delta);
-                window.request_redraw();
-            }
+        let target_zoom = slippy.current_zoom();
+
+        Self {
+            window,
+            input_state,
+            slippy,
+            tile_loader,
+            target_zoom,
+            frame_times: VecDeque::new(),
+            frame_time: Instant::now(),
         }
-        Event::WindowEvent {
-            event: WindowEvent::MouseWheel { delta, .. },
-            ..
-        } => {
-            let y = match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
-                winit::event::MouseScrollDelta::PixelDelta(y) => y.y as f64,
-            };
+    }
 
-            let zoom_amount = y * 0.25;
-            target_zoom += zoom_amount;
-            target_zoom = target_zoom.max(1.0).min(23.0);
-        }
-        Event::MainEventsCleared => {
-            *control_flow = ControlFlow::Wait;
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::RedrawRequested => {
+                let zoom = self.slippy.current_zoom();
+                if zoom != self.target_zoom {
+                    let diff = zoom - self.target_zoom;
+                    let scroll = (0.02 * diff.abs()).max(0.01);
 
-            let zoom = slippy.current_zoom();
-            if zoom != target_zoom {
-                *control_flow = ControlFlow::Poll;
-                let diff = zoom - target_zoom;
-                let scroll = (0.014 * diff.abs()).max(0.006);
-
-                if diff.abs() < scroll || diff.abs() < 0.015 {
-                    slippy.set_zoom(target_zoom);
-                } else {
-                    let factor = scroll * diff.signum();
-                    slippy.zoom(factor, input_state.mouse_position);
+                    if diff.abs() < scroll || diff.abs() < 0.015 {
+                        self.slippy.set_zoom(self.target_zoom);
+                    } else {
+                        let factor = scroll * diff.signum();
+                        self.slippy.zoom(factor, self.input_state.mouse_position);
+                    }
                 }
-                window.request_redraw();
-            }
 
-            for (tile, _rect) in slippy.screen_tiles() {
-                if !wgfx.has_tile(tile) {
-                    tile_loader.prepare_tile(tile);
+                for (tile, _rect) in self.slippy.screen_tiles() {
+                    if !self.window.gfx().has_tile(tile) {
+                        self.tile_loader.prepare_tile(tile);
+                    }
                 }
-            }
 
-            if zoom != target_zoom {
-                for tile in slippy.nearby_tiles(target_zoom) {
-                    if !wgfx.has_tile(tile) {
-                        tile_loader.prepare_tile(tile);
+                if zoom != self.target_zoom {
+                    for tile in self.slippy.nearby_tiles(self.target_zoom) {
+                        if !self.window.gfx().has_tile(tile) {
+                            self.tile_loader.prepare_tile(tile);
+                        }
+                    }
+                }
+
+                if self.target_zoom != self.slippy.current_zoom() {
+                    self.window.request_redraw();
+                }
+
+                let r = self.window.gfx().render(
+                    self.slippy.screen_tiles(),
+                    self.slippy.current_zoom() as f32,
+                    self.slippy.scale() as f32,
+                );
+
+                self.frame_times.push_back(self.frame_time.elapsed());
+                self.frame_time = Instant::now();
+
+                if self.frame_times.len() > 100 {
+                    let _ = self.frame_times.pop_front();
+                    let avg = self
+                        .frame_times
+                        .iter()
+                        .sum::<std::time::Duration>()
+                        .as_secs_f64()
+                        / self.frame_times.len() as f64;
+                    let fps = 1.0 / avg;
+                    let max = self.frame_times.iter().max().unwrap().as_secs_f64() * 1000.0;
+                    eprintln!("{:.1}fps {:.1}avg {:.1}max", fps, avg * 1000.0, max);
+                }
+
+                if let Err(e) = r {
+                    eprintln!("{:?}", e);
+                    if e == wgpu::SurfaceError::Outdated {
+                        self.window.gfx().reconfigure();
                     }
                 }
             }
+            WindowEvent::Resized(size) => {
+                let size = V2::new(size.width, size.height);
+                self.window.gfx().resize(size);
+                self.slippy.resize(size);
+                self.window.request_redraw();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let delta = self
+                    .input_state
+                    .set_mouse_position(V2::new(position.x, position.y));
+
+                if self.input_state.get_mouse_button(MouseButton::Left) {
+                    self.slippy.pan(delta);
+                    self.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == winit::event::ElementState::Pressed;
+
+                if let winit::event::MouseButton::Left = button {
+                    let cursor_icon = if pressed {
+                        winit::window::CursorIcon::Grabbing
+                    } else {
+                        winit::window::CursorIcon::Default
+                    };
+
+                    self.window.window().set_cursor(cursor_icon);
+                }
+                self.input_state.set_mouse_button(button, pressed);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let y = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
+                    winit::event::MouseScrollDelta::PixelDelta(y) => y.y as f64,
+                };
+
+                let zoom_amount = y * 0.25;
+                self.target_zoom += zoom_amount;
+                self.target_zoom = self.target_zoom.max(1.0).min(23.0);
+
+                self.window.request_redraw();
+            }
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+            }
+            _ => (),
         }
-        _ => (),
-    });
+    }
+
+    fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::TilePrepared(tile) => {
+                self.window.gfx().store_tile(tile);
+                self.window.request_redraw();
+            }
+        }
+    }
 }
+
 struct InputState {
     mouse: HashSet<MouseButton>,
     mouse_position: V2<f64>,
@@ -608,6 +715,7 @@ impl MbTilesSource {
                 self.decompress_buf.clear();
                 decoder.read_to_end(&mut self.decompress_buf).unwrap();
 
+                // Changed protobuf def. to use `bytes` instead of `string` for labels, to avoid some non utf-8 data
                 let tile = Tile::decode(self.decompress_buf.as_slice()).unwrap();
                 Ok(tile)
             })
@@ -771,12 +879,12 @@ pub struct FeatureDraw {
 
 #[derive(Debug, Copy, Clone)]
 enum Value<'a> {
-    String(&'a str),
+    String(&'a bstr::BStr),
     Number(f64),
 }
 
 impl<'a> Value<'a> {
-    fn as_str(&self) -> Option<&'a str> {
+    fn as_str(&self) -> Option<&'a bstr::BStr> {
         match self {
             Value::String(s) => Some(s),
             Value::Number(_) => None,
@@ -795,14 +903,14 @@ impl std::fmt::Display for Value<'_> {
 
 impl From<&'static str> for Value<'static> {
     fn from(value: &'static str) -> Self {
-        Value::String(value)
+        Value::String(value.as_bytes().as_bstr())
     }
 }
 
 impl<'a> From<&'a proto::tile::Value> for Value<'a> {
     fn from(value: &'a proto::tile::Value) -> Self {
         if let Some(s) = value.string_value.as_ref() {
-            Value::String(s)
+            Value::String(s.as_bstr())
         } else if let Some(n) = value.float_value {
             Value::Number(n as f64)
         } else if let Some(n) = value.double_value {

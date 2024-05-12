@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use bstr::ByteSlice;
 use serde::Deserialize;
 
 use super::FeatureView;
