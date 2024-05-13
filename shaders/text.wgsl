@@ -60,15 +60,13 @@ fn vs_main(text: VertexInput) -> VertexOutput {
     return out;
 }
 
-@group(0) @binding(0)
-var t_text_atlas: texture_2d<f32>;
-@group(0)@binding(1)
-var s_text_atlas: sampler;
+@group(0) @binding(0) var t_text_atlas: texture_2d<f32>;
+@group(0) @binding(1) var s_text_atlas: sampler;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var coverage = textureSample(t_text_atlas, s_text_atlas, in.uv).x;
 
-    return vec4(in.color.xyz, in.color.w * coverage);
+    return vec4(pow(in.color.xyz, vec3(2.2)), in.color.w * coverage);
 }
 

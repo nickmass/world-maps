@@ -33,17 +33,17 @@ impl Default for GlyphRenderState {
 }
 
 impl GlyphRender {
-    pub fn prepare(&mut self, text_size: f32, glyph_id: GlyphId) {
+    pub fn prepare(&mut self, text_size: f32, glyph_id: GlyphId) -> bool {
         let glyph_key = glyph_id.with_size(text_size);
 
-        if glyph_id.1 == ' ' || self.atlas_contents.read().unwrap().contains_key(&glyph_key) {
-            return;
+        if self.atlas_contents.read().unwrap().contains_key(&glyph_key) {
+            return true;
         }
 
         {
             let mut upload = self.glyph_upload.write().unwrap();
             if upload.contains_key(&glyph_key) {
-                return;
+                return false;
             } else {
                 upload.insert(glyph_key, GlyphUploadEntry::Pending);
             }
@@ -58,6 +58,8 @@ impl GlyphRender {
             let mut upload = self.glyph_upload.write().unwrap();
             upload.insert(glyph_key, GlyphUploadEntry::Prepared(metrics, bitmap));
         }
+
+        false
     }
 }
 

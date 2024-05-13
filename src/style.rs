@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use bstr::ByteSlice;
 use serde::Deserialize;
+use smallvec::SmallVec;
 
 use super::FeatureView;
 
@@ -243,7 +244,8 @@ pub struct Paint {
     line_color: Option<Parameter<Color>>,
     line_opacity: Option<Parameter<f32>>,
     line_width: Option<Parameter<f32>>,
-    line_dasharray: Option<Exists>,
+    line_dasharray: Option<SmallVec<[f32; 8]>>,
+    line_gap_width: Option<Parameter<f32>>,
     fill_antialias: Option<Parameter<bool>>,
     fill_color: Option<Parameter<Color>>,
     fill_opacity: Option<Parameter<f32>>,
@@ -316,8 +318,12 @@ impl Paint {
         get_parameter(self.line_width.as_ref(), zoom).unwrap_or(1.0)
     }
 
+    pub fn line_dasharray(&self) -> SmallVec<[f32; 8]> {
+        self.line_dasharray.clone().unwrap_or(SmallVec::new())
+    }
+
     pub fn unsupported(&self) -> bool {
-        self.fill_pattern.is_some()
+        self.fill_pattern.is_some() | self.line_gap_width.is_some()
     }
 }
 

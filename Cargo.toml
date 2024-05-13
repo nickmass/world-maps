@@ -18,10 +18,10 @@ winit = "0.30"
 math = {git = "https://github.com/nickmass/mass-math.git", features = ["bytemuck"]}
 wgpu = "0.20"
 pollster = "0.2.5"
-bytemuck = {version = "1.13.0", features = ["derive"]}
+bytemuck = {version = "1.15.0", features = ["derive"]}
 smartstring = "1.0.1"
 notosans = "0.1.0"
-fontdue = "0.7.3"
+fontdue = "0.8.0"
 clap = {version = "4.1.3", features = ["derive"]}
 bstr = "1.1.0"
 env_logger = "0.11.3"

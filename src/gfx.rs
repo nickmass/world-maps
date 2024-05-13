@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use math::{Rect, V2, V4};
+use math::{Rect, M3, V2, V4};
 
 use crate::text::{
     AtlasEntry, GlyphKey, GlyphRender, GlyphRenderState, GlyphUploadEntry, TEXT_ATLAS_SIZE,
@@ -15,7 +15,7 @@ use crate::{FeatureDraw, LayerLabelDraw, RectExt, TileId};
 
 pub const TILE_WGSL: &'static str = include_str!("../shaders/tile.wgsl");
 pub const TEXT_WGSL: &'static str = include_str!("../shaders/text.wgsl");
-pub const PUSH_CONSTANT_LIMIT: usize = 128;
+pub const PUSH_CONSTANT_LIMIT: usize = 256;
 
 pub struct Gfx {
     window: &'static Window,
@@ -84,7 +84,7 @@ impl Gfx {
                 label: Some("tile-pipeline-layout"),
                 bind_group_layouts: &[],
                 push_constant_ranges: &[wgpu::PushConstantRange {
-                    stages: wgpu::ShaderStages::VERTEX,
+                    stages: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     range: 0..PUSH_CONSTANT_LIMIT as u32,
                 }],
             });
@@ -185,7 +185,7 @@ impl Gfx {
             return;
         }
 
-        if !tile_geo.text.complete {
+        if !tile_geo.text.is_some() {
             return;
         }
 
@@ -266,16 +266,18 @@ impl Gfx {
                         scissor.width(),
                         scissor.height(),
                     );
+
+                    let transform = TileTransform::new(self.size, rect);
+
                     render_pass.set_vertex_buffer(0, tile.vertex_buffer.slice(..));
                     render_pass
                         .set_index_buffer(tile.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
                     for feature in tile.features.iter() {
                         let style = feature.paint.style(zoom);
-                        let uniforms = TileUniforms::new(self.size, scale, rect, style);
-
+                        let uniforms = transform.to_uniforms(rect.dimensions().x as f32, style);
                         render_pass.set_push_constants(
-                            wgpu::ShaderStages::VERTEX,
+                            wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                             0,
                             bytemuck::bytes_of(&uniforms),
                         );
@@ -335,13 +337,19 @@ impl Gfx {
                 continue;
             };
 
+            let text = if let Some(text) = tile.text.as_ref() {
+                text
+            } else {
+                continue;
+            };
+
             text_pass.insert_debug_marker("new tile");
-            text_pass.set_vertex_buffer(0, tile.text.vertex_buffer.slice(..));
-            text_pass.set_index_buffer(tile.text.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            text_pass.set_vertex_buffer(0, text.vertex_buffer.slice(..));
+            text_pass.set_index_buffer(text.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
             label_bounds.clear();
 
-            for layer in tile.text.layers.iter().rev() {
+            for layer in text.layers.iter().rev() {
                 let style = layer.paint.style(zoom);
 
                 let uniforms = TextUniforms::new(self.size, self.tile_size, scale, rect, &style);
@@ -388,6 +396,20 @@ pub struct GfxHandle {
 }
 
 impl GfxHandle {
+    pub fn prepare_glyphs(&mut self, labels: &[LayerLabelDraw]) -> bool {
+        let mut glyphs_available = true;
+
+        for layer in labels.iter() {
+            for label in layer.labels.iter() {
+                for glyph in label.glyphs() {
+                    glyphs_available &= self.glyph_render.prepare(label.text_size, glyph.glyph);
+                }
+            }
+        }
+
+        glyphs_available
+    }
+
     pub fn create_geometry(
         &mut self,
         tile_id: TileId,
@@ -412,14 +434,6 @@ impl GfxHandle {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        for layer in labels.iter() {
-            for label in layer.labels.iter() {
-                for glyph in label.glyphs() {
-                    self.glyph_render.prepare(label.text_size, glyph.glyph)
-                }
-            }
-        }
-
         let text = self.create_text_geometry(labels);
 
         TileGeometry {
@@ -431,12 +445,11 @@ impl GfxHandle {
         }
     }
 
-    pub fn create_text_geometry(&self, tile_layers: &[LayerLabelDraw]) -> TextBuffers {
+    pub fn create_text_geometry(&self, tile_layers: &[LayerLabelDraw]) -> Option<TextBuffers> {
         let mut vertices: Vec<TextVertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         let mut layers = Vec::new();
         let mut labels = Vec::new();
-        let mut complete = true;
 
         {
             let cache = self.glyph_render.atlas_contents.read().unwrap();
@@ -501,9 +514,7 @@ impl GfxHandle {
                                 indices.push(idx + 3);
                             }
                         } else {
-                            if glyph.glyph.1 != ' ' {
-                                complete = false;
-                            }
+                            return None;
                         }
                     }
 
@@ -592,12 +603,11 @@ impl GfxHandle {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        TextBuffers {
+        Some(TextBuffers {
             vertex_buffer,
             index_buffer,
             layers,
-            complete,
-        }
+        })
     }
 }
 
@@ -606,7 +616,7 @@ pub struct TileGeometry {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     features: Vec<FeatureDraw>,
-    text: TextBuffers,
+    text: Option<TextBuffers>,
 }
 
 struct GlyphPipeline {
@@ -643,9 +653,9 @@ impl GlyphPipeline {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -837,7 +847,6 @@ pub struct TextBuffers {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     layers: Vec<LabelLayerGeometry>,
-    complete: bool,
 }
 
 pub struct GpuTileCache<T> {
@@ -887,7 +896,7 @@ struct TileEntry<T> {
 }
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Copy, Clone, bytemuck::NoUninit)]
 struct TextVertex {
     position: V2<f32>,
     uv: V2<f32>,
@@ -911,18 +920,20 @@ impl TextVertex {
 }
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-// Sorted fields in a weird order to fix possibly padding issue with shader
+#[derive(Debug, Copy, Clone, bytemuck::NoUninit)]
+// Sorted fields in a weird order for padding/alignment
 struct TileUniforms {
-    scale: f32,
-    line_width: f32,
-    offset: V2<f32>,
-    tile_dims: V2<f32>,
-    window_dims: V2<f32>,
     fill_translate: V2<f32>,
     line_translate: V2<f32>,
     fill_color: V4<f32>,
     line_color: V4<f32>,
+    transform_c0: V4<f32>,
+    transform_c1: V4<f32>,
+    transform_c2: V4<f32>,
+    line_width: f32,
+    line_dasharray: [f32; 8],
+    line_dasharray_len: u32,
+    line_dasharray_total: f32,
 }
 
 const _: () = assert!(
@@ -930,25 +941,75 @@ const _: () = assert!(
     "TileUniforms must fit within push constant limit"
 );
 
+struct TileTransform {
+    transform: M3<f32>,
+}
+
+impl TileTransform {
+    fn new(window_size: V2<u32>, rect: Rect<i32>) -> Self {
+        use math::v3;
+        let to_pixels = M3::new(
+            v3(rect.dimensions().x as f32, 0.0, 0.0),
+            v3(0.0, rect.dimensions().y as f32, 0.0),
+            rect.min.as_f32().expand(1.0),
+        );
+
+        let to_normalized = M3::new(
+            v3(1.0 / window_size.x as f32, 0.0, 0.0),
+            v3(0.0, 1.0 / window_size.y as f32, 0.0),
+            v3(0.0, 0.0, 1.0),
+        );
+
+        let to_view = M3::new(v3(2.0, 0.0, 0.0), v3(0.0, -2.0, 0.0), v3(-1.0, 1.0, 1.0));
+
+        let transform = to_view * to_normalized * to_pixels;
+
+        Self { transform }
+    }
+
+    fn to_uniforms(&self, scale: f32, style: super::FeatureStyle) -> TileUniforms {
+        TileUniforms::new(self.transform, scale, style)
+    }
+}
+
 impl TileUniforms {
-    fn new(window_size: V2<u32>, scale: f32, rect: Rect<i32>, style: super::FeatureStyle) -> Self {
+    fn new(transform: M3<f32>, scale: f32, style: super::FeatureStyle) -> Self {
+        let line_width = style.line_width() / scale;
+        let line_dasharray_vec = style.line_dasharray();
+
+        let mut line_dasharray = [0.0; 8];
+        let mut line_dasharray_len = 0;
+        let mut line_dasharray_total = 0.0;
+
+        if line_dasharray_vec.len() <= 8 {
+            for n in line_dasharray_vec {
+                let n = n * line_width;
+                line_dasharray[line_dasharray_len as usize] = n;
+                line_dasharray_total += n;
+
+                line_dasharray_len += 1;
+            }
+        }
+
         Self {
-            offset: rect.min.as_f32(),
-            tile_dims: rect.dimensions().as_f32(),
-            window_dims: window_size.as_f32(),
-            scale,
+            fill_translate: style.fill_translate() / scale,
+            line_translate: style.line_translate() / scale,
             fill_color: style.fill_color().as_v4(),
-            fill_translate: style.fill_translate(),
             line_color: style.line_color().as_v4(),
-            line_translate: style.line_translate(),
-            line_width: style.line_width(),
+            transform_c0: transform.c0.expand(0.0),
+            transform_c1: transform.c1.expand(0.0),
+            transform_c2: transform.c2.expand(0.0),
+            line_width,
+            line_dasharray,
+            line_dasharray_len,
+            line_dasharray_total,
         }
     }
 }
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-// Sorted fields in a weird order to fix possibly padding issue with shader
+#[derive(Debug, Copy, Clone, bytemuck::NoUninit)]
+// Sorted fields in a weird order for padding/alignment
 struct TextUniforms {
     scale: f32,
     halo_width: f32,
@@ -994,18 +1055,25 @@ pub struct LabelLayerGeometry {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, Debug, bytemuck::NoUninit)]
 pub struct GeoVertex {
     pub position: V2<f32>,
     pub normal: V2<f32>,
-    pub fill: u32,
+    pub advancement: f32,
+    pub fill: FillMode,
 }
 
-impl GeoVertex {}
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, bytemuck::NoUninit)]
+pub enum FillMode {
+    Line = 0,
+    Polygon = 1,
+    Background = 2,
+}
 
 impl GeoVertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32];
+    const ATTRIBS: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32, 3 => Uint32];
 
     fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
         use std::mem;
@@ -1021,22 +1089,26 @@ impl GeoVertex {
         GeoVertex {
             position: V2::new(-0.1, -0.1),
             normal: V2::zero(),
-            fill: 1,
+            advancement: 0.0,
+            fill: FillMode::Background,
         },
         GeoVertex {
             position: V2::new(1.1, -0.1),
             normal: V2::zero(),
-            fill: 1,
+            advancement: 0.0,
+            fill: FillMode::Background,
         },
         GeoVertex {
             position: V2::new(1.1, 1.1),
             normal: V2::zero(),
-            fill: 1,
+            advancement: 0.0,
+            fill: FillMode::Background,
         },
         GeoVertex {
             position: V2::new(-0.1, 1.1),
             normal: V2::zero(),
-            fill: 1,
+            advancement: 0.0,
+            fill: FillMode::Background,
         },
     ];
 

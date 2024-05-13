@@ -40,7 +40,7 @@ mod style;
 mod text;
 
 const TILE_SIZE: u32 = 256;
-const LINE_WIDTH_SCALE: f32 = 1.0 / TILE_SIZE as f32;
+//const LINE_WIDTH_SCALE: f32 = 1.0 / TILE_SIZE as f32;
 
 /// Navigate OSM MBTiles tilesets
 #[derive(Parser, Debug)]
@@ -139,6 +139,7 @@ struct ApplicationState {
     target_zoom: f64,
     frame_times: VecDeque<Duration>,
     frame_time: Instant,
+    tiles_pending_glyphs: HashSet<TileId>,
 }
 
 impl ApplicationState {
@@ -182,13 +183,6 @@ impl ApplicationState {
                     tile_handle.process_tiles(proxy);
                 }
             });
-        for tile in slippy.nearby_tiles(slippy.current_zoom() + 1.0) {
-            tile_loader.prepare_tile(tile);
-        }
-
-        for tile in slippy.nearby_tiles(slippy.current_zoom() - 1.0) {
-            tile_loader.prepare_tile(tile);
-        }
 
         let target_zoom = slippy.current_zoom();
 
@@ -200,6 +194,7 @@ impl ApplicationState {
             target_zoom,
             frame_times: VecDeque::new(),
             frame_time: Instant::now(),
+            tiles_pending_glyphs: HashSet::new(),
         }
     }
 
@@ -248,6 +243,12 @@ impl ApplicationState {
                     self.slippy.scale() as f32,
                 );
 
+                for tile_id in self.tiles_pending_glyphs.drain() {
+                    if !self.window.gfx().has_tile(tile_id) {
+                        self.tile_loader.prepare_tile(tile_id);
+                    }
+                }
+
                 self.frame_times.push_back(self.frame_time.elapsed());
                 self.frame_time = Instant::now();
 
@@ -261,7 +262,7 @@ impl ApplicationState {
                         / self.frame_times.len() as f64;
                     let fps = 1.0 / avg;
                     let max = self.frame_times.iter().max().unwrap().as_secs_f64() * 1000.0;
-                    eprintln!("{:.1}fps {:.1}avg {:.1}max", fps, avg * 1000.0, max);
+                    //eprintln!("{:.1}fps {:.1}avg {:.1}max", fps, avg * 1000.0, max);
                 }
 
                 if let Err(e) = r {
@@ -299,6 +300,11 @@ impl ApplicationState {
 
                     self.window.window().set_cursor(cursor_icon);
                 }
+                if let winit::event::MouseButton::Right = button {
+                    if pressed && !self.input_state.get_mouse_button(MouseButton::Right) {
+                        self.window.request_redraw();
+                    }
+                }
                 self.input_state.set_mouse_button(button, pressed);
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -325,6 +331,9 @@ impl ApplicationState {
             UserEvent::TilePrepared(tile) => {
                 self.window.gfx().store_tile(tile);
                 self.window.request_redraw();
+            }
+            UserEvent::TilePendingGlyphs(tile_id) => {
+                self.tiles_pending_glyphs.insert(tile_id);
             }
         }
     }
@@ -726,22 +735,32 @@ impl MbTilesSource {
 }
 
 struct TileLoaderHandle {
-    data_receiver: mpsc::Receiver<gfx::TileGeometry>,
+    data_receiver: mpsc::Receiver<TilePrepare>,
     pending_tiles: Arc<Mutex<HashSet<TileId>>>,
 }
 
 impl TileLoaderHandle {
     fn process_tiles(&self, proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
         for tile in self.data_receiver.iter() {
-            let tile_id = tile.tile_id;
-            let _ = proxy.send_event(UserEvent::TilePrepared(tile));
-
-            {
-                let mut pending_tiles = self.pending_tiles.lock().unwrap();
-                pending_tiles.remove(&tile_id);
+            let mut pending_tiles = self.pending_tiles.lock().unwrap();
+            match tile {
+                TilePrepare::Ready(tile) => {
+                    let tile_id = tile.tile_id;
+                    let _ = proxy.send_event(UserEvent::TilePrepared(tile));
+                    pending_tiles.remove(&tile_id);
+                }
+                TilePrepare::PendingGlyphs(tile_id) => {
+                    let _ = proxy.send_event(UserEvent::TilePendingGlyphs(tile_id));
+                    pending_tiles.remove(&tile_id);
+                }
             }
         }
     }
+}
+
+enum TilePrepare {
+    Ready(gfx::TileGeometry),
+    PendingGlyphs(TileId),
 }
 
 struct TileLoader {
@@ -804,6 +823,7 @@ impl TileLoader {
 
 enum UserEvent {
     TilePrepared(gfx::TileGeometry),
+    TilePendingGlyphs(TileId),
 }
 
 struct TileWorker {
@@ -816,7 +836,7 @@ impl TileWorker {
         id: usize,
         style: style::Style,
         gfx: gfx::GfxHandle,
-        data_sender: mpsc::Sender<gfx::TileGeometry>,
+        data_sender: mpsc::Sender<TilePrepare>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
 
@@ -843,7 +863,7 @@ impl TileWorker {
         db_path: P,
         style: style::Style,
         mut gfx: gfx::GfxHandle,
-        data_sender: mpsc::Sender<gfx::TileGeometry>,
+        data_sender: mpsc::Sender<TilePrepare>,
         receiver: mpsc::Receiver<TileId>,
     ) {
         let mut tile_loader = MbTilesSource::new(db_path.as_ref());
@@ -853,16 +873,22 @@ impl TileWorker {
             if let Some(tile) = tile_loader.query_tile(tile_id) {
                 tesselator.tesselate_tile(tile_id, &tile);
 
-                let geo = gfx.create_geometry(
-                    tile_id,
-                    tesselator.vertices(),
-                    tesselator.indices(),
-                    tesselator.features().to_vec(),
-                    tesselator.labels(),
-                );
+                if gfx.prepare_glyphs(tesselator.labels()) {
+                    let geo = gfx.create_geometry(
+                        tile_id,
+                        tesselator.vertices(),
+                        tesselator.indices(),
+                        tesselator.features().to_vec(),
+                        tesselator.labels(),
+                    );
 
-                if let Err(_) = data_sender.send(geo) {
-                    break;
+                    if let Err(_) = data_sender.send(TilePrepare::Ready(geo)) {
+                        break;
+                    }
+                } else {
+                    if let Err(_) = data_sender.send(TilePrepare::PendingGlyphs(tile_id)) {
+                        break;
+                    }
                 }
             } else {
                 eprintln!("tile not found: {:?}", tile_id);
@@ -1070,6 +1096,8 @@ impl FeaturePaint {
         let text_halo_width = self.paint.text_halo_width(zoom).into();
         let text_halo_color = self.paint.text_halo_color(zoom).into();
 
+        let line_dasharray = self.paint.line_dasharray();
+
         FeatureStyle {
             background_color,
             line_color,
@@ -1080,6 +1108,7 @@ impl FeaturePaint {
             text_color,
             text_halo_width,
             text_halo_color,
+            line_dasharray,
             kind: self.kind,
         }
     }
@@ -1097,6 +1126,7 @@ pub struct FeatureStyle {
     text_color: Color,
     text_halo_width: f32,
     text_halo_color: Color,
+    line_dasharray: SmallVec<[f32; 8]>,
 }
 
 impl FeatureStyle {
@@ -1123,11 +1153,11 @@ impl FeatureStyle {
     }
 
     pub fn line_width(&self) -> f32 {
-        self.line_width * LINE_WIDTH_SCALE as f32
+        self.line_width
     }
 
     pub fn fill_translate(&self) -> V2<f32> {
-        self.fill_translate * V2::fill(LINE_WIDTH_SCALE as f32)
+        self.fill_translate
     }
 
     pub fn line_translate(&self) -> V2<f32> {
@@ -1147,6 +1177,10 @@ impl FeatureStyle {
 
     pub fn text_halo_width(&self) -> f32 {
         self.text_halo_width * 1.5
+    }
+
+    pub fn line_dasharray(&self) -> SmallVec<[f32; 8]> {
+        self.line_dasharray.clone()
     }
 }
 
@@ -1168,8 +1202,8 @@ impl VectorTileTesselator {
         let fill_options = FillOptions::default().with_tolerance(0.001);
         let fill_tessellator = FillTessellator::new();
         let stroke_options = StrokeOptions::default()
-            .with_tolerance(LINE_WIDTH_SCALE / 10.0)
-            .with_line_width(LINE_WIDTH_SCALE);
+            .with_tolerance(0.001)
+            .with_line_width(1.0);
         let stroke_tessellator = StrokeTessellator::new();
         let geometry: VertexBuffers<GeoVertex, u32> = VertexBuffers::new();
         let feature_draw = Vec::new();
@@ -1258,7 +1292,8 @@ impl VectorTileTesselator {
                                     |vertex: FillVertex| GeoVertex {
                                         position: vertex.position().to_tuple().into(),
                                         normal: V2::fill(0.0),
-                                        fill: 1,
+                                        advancement: 0.0,
+                                        fill: gfx::FillMode::Polygon,
                                     },
                                 );
 
@@ -1288,7 +1323,8 @@ impl VectorTileTesselator {
                                     |vertex: StrokeVertex| GeoVertex {
                                         position: vertex.position_on_path().to_tuple().into(),
                                         normal: vertex.normal().to_tuple().into(),
-                                        fill: 0,
+                                        advancement: vertex.advancement(),
+                                        fill: gfx::FillMode::Line,
                                     },
                                 );
 
@@ -1312,7 +1348,8 @@ impl VectorTileTesselator {
                                     GeoVertex {
                                         position: vertex.position_on_path().to_tuple().into(),
                                         normal: vertex.normal().to_tuple().into(),
-                                        fill: 0,
+                                        advancement: vertex.advancement(),
+                                        fill: gfx::FillMode::Line,
                                     }
                                 });
 
@@ -1359,16 +1396,19 @@ impl VectorTileTesselator {
                                             };
                                             lines.push(line);
                                             glyphs.clear();
+                                            last_glyph = None;
                                             h_offset = 0.0;
                                             v_offset -= v_advance;
                                             continue;
                                         }
 
                                         if c.is_control() {
+                                            last_glyph = None;
                                             continue;
                                         }
 
                                         if font.lookup_glyph_index(c) == 0 {
+                                            last_glyph = None;
                                             continue;
                                         }
 
@@ -1390,10 +1430,12 @@ impl VectorTileTesselator {
                                         bounds_min = bounds_min.min(bounds.min).min(bounds.max);
                                         bounds_max = bounds_max.max(bounds.max).max(bounds.min);
 
-                                        glyphs.push(GlyphDraw {
-                                            bounds,
-                                            glyph: glyph_id,
-                                        });
+                                        if !c.is_whitespace() {
+                                            glyphs.push(GlyphDraw {
+                                                bounds,
+                                                glyph: glyph_id,
+                                            });
+                                        }
 
                                         h_offset += metrics.advance_width;
                                     }
