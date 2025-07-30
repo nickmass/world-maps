@@ -69,4 +69,3 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     return vec4(pow(in.color.xyz, vec3(2.2)), in.color.w * coverage);
 }
-

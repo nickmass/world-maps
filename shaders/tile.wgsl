@@ -8,6 +8,8 @@ struct TileConstants {
     line_dasharray: array<f32, 8>,
     line_dasharray_len: u32,
     line_dasharray_total: f32,
+    rescale_scale: f32,
+    rescale_offset: vec2<f32>
 }
 
 var<push_constant> tile_constants: TileConstants;
@@ -22,7 +24,7 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
-    @location(1) advancement: f32,
+    @location(1) @interpolate(linear) advancement: f32,
 }
 
 const FILL_LINE: u32 = 0;
@@ -30,7 +32,10 @@ const FILL_POLYGON: u32 = 1;
 const FILL_BACKGROUND: u32 = 2;
 
 @vertex
-fn vs_main(tile: VertexInput) -> VertexOutput {
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var tile = input;
+    tile.position = (tile.position - tile_constants.rescale_offset) * tile_constants.rescale_scale;
+
     var out: VertexOutput;
     var position: vec2<f32>;
 
@@ -77,4 +82,3 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     return vec4(pow(in.color.xyz, vec3(2.2)), in.color.w);
 }
-

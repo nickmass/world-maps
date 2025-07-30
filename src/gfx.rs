@@ -1,17 +1,18 @@
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
-};
+use std::sync::{Arc, Mutex, RwLock};
 
-use math::{Rect, M3, V2, V4};
+use ahash::AHashMap as HashMap;
+use math::{M3, Rect, V2, V4};
 
-use crate::text::{
-    AtlasEntry, GlyphKey, GlyphRender, GlyphRenderState, GlyphUploadEntry, TEXT_ATLAS_SIZE,
+use crate::{FeatureDraw, LayerLabelDraw, RectExt, TileId, tile_source::TileRectBuilder};
+use crate::{
+    text::{
+        AtlasEntry, GlyphKey, GlyphRender, GlyphRenderState, GlyphUploadEntry, TEXT_ATLAS_SIZE,
+    },
+    tile_source::TileRect,
 };
-use crate::{FeatureDraw, LayerLabelDraw, RectExt, TileId};
 
 pub const TILE_WGSL: &'static str = include_str!("../shaders/tile.wgsl");
 pub const TEXT_WGSL: &'static str = include_str!("../shaders/text.wgsl");
@@ -27,22 +28,23 @@ pub struct Gfx {
     multisampled_framebuffer: wgpu::TextureView,
     instance: wgpu::Instance,
     size: V2<u32>,
-    tile_cache: GpuTileCache<TileGeometry>,
+    tile_cache: TileGeometryCache,
     samples: u32,
     glyph_pipeline: GlyphPipeline,
     tile_size: V2<f32>,
 }
 
 impl Gfx {
-    pub fn new(window: &'static Window, tile_size: u32) -> Self {
+    pub fn new(window: &'static Window, tile_size: f32) -> Self {
         let size = window.inner_size();
         let size = V2::new(size.width, size.height);
-        let tile_size = V2::fill(tile_size).as_f32();
+        let tile_size = V2::fill(tile_size);
         let samples = 4;
 
-        let instance_desc = wgpu::InstanceDescriptor::default();
+        let mut instance_desc = wgpu::InstanceDescriptor::default();
+        instance_desc.flags |= wgpu::InstanceFlags::DEBUG;
 
-        let instance = wgpu::Instance::new(instance_desc);
+        let instance = wgpu::Instance::new(&instance_desc);
         let surface = instance.create_surface(window).unwrap();
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -51,17 +53,16 @@ impl Gfx {
         });
         let adapter = pollster::block_on(adapter).unwrap();
 
-        let device_request = adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::PUSH_CONSTANTS,
-                required_limits: wgpu::Limits {
-                    max_push_constant_size: PUSH_CONSTANT_LIMIT as u32,
-                    ..Default::default()
-                },
-                label: Some("device"),
+        let device_request = adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::PUSH_CONSTANTS,
+            required_limits: wgpu::Limits {
+                max_push_constant_size: PUSH_CONSTANT_LIMIT as u32,
+                ..Default::default()
             },
-            None,
-        );
+            label: Some("device"),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        });
 
         let (device, queue) = pollster::block_on(device_request).unwrap();
 
@@ -94,13 +95,13 @@ impl Gfx {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[GeoVertex::desc()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -124,6 +125,7 @@ impl Gfx {
                 alpha_to_coverage_enabled: false,
             },
             multiview: None,
+            cache: None,
         });
 
         let multisampled_framebuffer =
@@ -139,7 +141,7 @@ impl Gfx {
             render_pipeline,
             multisampled_framebuffer,
             size,
-            tile_cache: GpuTileCache::new(),
+            tile_cache: TileGeometryCache::new(),
             samples,
             glyph_pipeline: glyph_renderer,
             tile_size,
@@ -185,7 +187,7 @@ impl Gfx {
             return;
         }
 
-        if !tile_geo.text.is_some() {
+        if tile_geo.text.is_none() {
             return;
         }
 
@@ -231,20 +233,33 @@ impl Gfx {
             });
 
         {
+            const DEBUG_TILES: bool = false;
+            let clear_color = if DEBUG_TILES {
+                wgpu::Color {
+                    r: 1.0,
+                    g: 0.0,
+                    b: 1.0,
+                    a: 1.0,
+                }
+            } else {
+                wgpu::Color {
+                    r: 0.79,
+                    g: 0.79,
+                    b: 0.79,
+                    a: 1.0,
+                }
+            };
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tile-render-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.multisampled_framebuffer,
                     resolve_target: Some(&view),
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.79 as f64,
-                            g: 0.79 as f64,
-                            b: 0.79 as f64,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -253,19 +268,26 @@ impl Gfx {
             render_pass.set_pipeline(&self.render_pipeline);
 
             for (tile_id, rect) in tiles.clone() {
-                let tile = if let Some(tile) = self.tile_cache.get(tile_id) {
-                    tile
-                } else {
+                let Some((tile, rescale_rect)) = self.tile_cache.get_with_rescale(tile_id) else {
                     continue;
                 };
 
                 if let Some(scissor) = rect.to_scissor(self.size) {
-                    render_pass.set_scissor_rect(
-                        scissor.min.x,
-                        scissor.min.y,
-                        scissor.width(),
-                        scissor.height(),
-                    );
+                    if DEBUG_TILES {
+                        render_pass.set_scissor_rect(
+                            scissor.min.x + 1,
+                            scissor.min.y + 1,
+                            scissor.width() - 2,
+                            scissor.height() - 2,
+                        );
+                    } else {
+                        render_pass.set_scissor_rect(
+                            scissor.min.x,
+                            scissor.min.y,
+                            scissor.width(),
+                            scissor.height(),
+                        );
+                    }
 
                     let transform = TileTransform::new(self.size, rect);
 
@@ -275,7 +297,8 @@ impl Gfx {
 
                     for feature in tile.features.iter() {
                         let style = feature.paint.style(zoom);
-                        let uniforms = transform.to_uniforms(rect.dimensions().x as f32, style);
+                        let uniforms =
+                            transform.to_uniforms(rect.dimensions().x as f32, style, rescale_rect);
                         render_pass.set_push_constants(
                             wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                             0,
@@ -318,6 +341,7 @@ impl Gfx {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
@@ -331,15 +355,11 @@ impl Gfx {
         let mut label_bounds: Vec<Rect<f32>> = Vec::new();
 
         for (tile_id, rect) in tiles {
-            let tile = if let Some(tile) = self.tile_cache.get(tile_id) {
-                tile
-            } else {
+            let Some(tile) = self.tile_cache.get(tile_id) else {
                 continue;
             };
 
-            let text = if let Some(text) = tile.text.as_ref() {
-                text
-            } else {
+            let Some(TileText::TextBuffers(text)) = tile.text.as_ref() else {
                 continue;
             };
 
@@ -445,7 +465,11 @@ impl GfxHandle {
         }
     }
 
-    pub fn create_text_geometry(&self, tile_layers: &[LayerLabelDraw]) -> Option<TextBuffers> {
+    pub fn create_text_geometry(&self, tile_layers: &[LayerLabelDraw]) -> Option<TileText> {
+        if tile_layers.is_empty() {
+            return Some(TileText::Empty);
+        }
+
         let mut vertices: Vec<TextVertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         let mut layers = Vec::new();
@@ -603,11 +627,11 @@ impl GfxHandle {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        Some(TextBuffers {
+        Some(TileText::TextBuffers(TextBuffers {
             vertex_buffer,
             index_buffer,
             layers,
-        })
+        }))
     }
 }
 
@@ -616,7 +640,12 @@ pub struct TileGeometry {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     features: Vec<FeatureDraw>,
-    text: Option<TextBuffers>,
+    text: Option<TileText>,
+}
+
+pub enum TileText {
+    Empty,
+    TextBuffers(TextBuffers),
 }
 
 struct GlyphPipeline {
@@ -717,13 +746,13 @@ impl GlyphPipeline {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[TextVertex::desc()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -747,6 +776,7 @@ impl GlyphPipeline {
                 alpha_to_coverage_enabled: false,
             },
             multiview: None,
+            cache: None,
         });
 
         Self {
@@ -803,7 +833,7 @@ impl GlyphPipeline {
                 }
 
                 queue.write_texture(
-                    wgpu::ImageCopyTexture {
+                    wgpu::TexelCopyTextureInfo {
                         texture: &self.atlas_texture,
                         mip_level: 0,
                         origin: wgpu::Origin3d {
@@ -814,7 +844,7 @@ impl GlyphPipeline {
                         aspect: wgpu::TextureAspect::All,
                     },
                     bitmap.as_slice(),
-                    wgpu::ImageDataLayout {
+                    wgpu::TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(width),
                         rows_per_image: None,
@@ -891,6 +921,44 @@ impl<T> GpuTileCache<T> {
     }
 }
 
+pub struct TileGeometryCache {
+    cache: GpuTileCache<TileGeometry>,
+}
+
+impl TileGeometryCache {
+    fn new() -> Self {
+        Self {
+            cache: GpuTileCache::new(),
+        }
+    }
+
+    fn insert(&mut self, tile_id: TileId, entry: TileGeometry) {
+        self.cache.insert(tile_id, entry);
+    }
+
+    fn get_with_rescale(&self, mut tile_id: TileId) -> Option<(&TileGeometry, TileRect)> {
+        let mut rect_builder = TileRectBuilder::default();
+
+        loop {
+            let tile = self.cache.get(tile_id);
+
+            let None = tile else {
+                return tile.zip(Some(rect_builder.rect()));
+            };
+
+            tile_id = rect_builder.parent(tile_id)?;
+        }
+    }
+
+    fn get(&self, tile_id: TileId) -> Option<&TileGeometry> {
+        self.cache.get(tile_id)
+    }
+
+    fn contains(&self, tile_id: TileId) -> bool {
+        self.cache.contains(tile_id)
+    }
+}
+
 struct TileEntry<T> {
     entry: T,
 }
@@ -934,6 +1002,8 @@ struct TileUniforms {
     line_dasharray: [f32; 8],
     line_dasharray_len: u32,
     line_dasharray_total: f32,
+    rescale_scale: f32,
+    rescale_offset: V2<f32>,
 }
 
 const _: () = assert!(
@@ -967,13 +1037,23 @@ impl TileTransform {
         Self { transform }
     }
 
-    fn to_uniforms(&self, scale: f32, style: super::FeatureStyle) -> TileUniforms {
-        TileUniforms::new(self.transform, scale, style)
+    fn to_uniforms(
+        &self,
+        scale: f32,
+        style: super::FeatureStyle,
+        rescale_rect: TileRect,
+    ) -> TileUniforms {
+        TileUniforms::new(self.transform, scale, style, rescale_rect)
     }
 }
 
 impl TileUniforms {
-    fn new(transform: M3<f32>, scale: f32, style: super::FeatureStyle) -> Self {
+    fn new(
+        transform: M3<f32>,
+        scale: f32,
+        style: super::FeatureStyle,
+        rescale_rect: TileRect,
+    ) -> Self {
         let line_width = style.line_width() / scale;
         let line_dasharray_vec = style.line_dasharray();
 
@@ -1003,6 +1083,8 @@ impl TileUniforms {
             line_dasharray,
             line_dasharray_len,
             line_dasharray_total,
+            rescale_offset: rescale_rect.offset,
+            rescale_scale: rescale_rect.scale,
         }
     }
 }

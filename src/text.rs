@@ -1,10 +1,8 @@
 use fontdue::{Font, Metrics};
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
-};
+use std::sync::{Arc, Mutex, RwLock};
 
+use ahash::AHashMap as HashMap;
 use math::V2;
 
 pub const TEXT_ATLAS_SIZE: u32 = 2048;
@@ -87,13 +85,31 @@ impl FontCollection {
     pub fn font<I: IntoIterator<Item = S>, S: AsRef<str>>(&mut self, names: I) -> (FontId, &Font) {
         let mut font_id = None;
 
+        use std::collections::HashSet;
+        static MISSING_FONTS: std::sync::OnceLock<Mutex<HashSet<String>>> =
+            std::sync::OnceLock::new();
+
+        let mut new_missing_font = false;
+
         for name in names {
             let name = name.as_ref();
             let found_face = match name {
-                "Noto Sans" | "Noto Sans Regular" => 1,
+                "Noto Sans" | "Noto Sans Regular" | "noto_sans_regular" => 1,
                 "Noto Sans Bold" => 2,
                 "Noto Sans Italic" => 3,
-                _ => continue,
+                _ => {
+                    let mut set = MISSING_FONTS
+                        .get_or_init(|| Mutex::new(HashSet::new()))
+                        .lock()
+                        .unwrap();
+
+                    if set.insert(name.to_string()) {
+                        eprintln!("missing font '{}'", name);
+                        new_missing_font = true;
+                    }
+
+                    continue;
+                }
             };
 
             font_id = Some(found_face);
@@ -101,7 +117,9 @@ impl FontCollection {
         }
 
         let font_id = font_id.unwrap_or_else(|| {
-            eprintln!("unable to find matching font face");
+            if new_missing_font {
+                eprintln!("no valid fonts, using 'Noto Sans'");
+            }
             1
         });
 

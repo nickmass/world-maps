@@ -1,6 +1,5 @@
-use bstr::ByteSlice;
+use bstr::{BStr, ByteSlice};
 use clap::Parser;
-use libflate::gzip;
 use lyon::{
     math::point,
     tessellation::{
@@ -8,9 +7,7 @@ use lyon::{
         StrokeVertex, VertexBuffers,
     },
 };
-use prost::Message;
-use proto::{tile::GeomType, Tile};
-use rusqlite::{Connection, OptionalExtension};
+use proto::{Tile, tile::GeomType};
 use smallvec::SmallVec;
 use winit::{
     event::{MouseButton, WindowEvent},
@@ -21,36 +18,40 @@ use winit::{
 use math::{Rect, V2, V4};
 
 use std::{
-    collections::{HashSet, VecDeque},
-    io::Read,
-    path::Path,
-    sync::{atomic::AtomicUsize, mpsc, Arc, Mutex},
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, Mutex, atomic::AtomicUsize, mpsc},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use crate::gfx::GeoVertex;
-use crate::text::{FontCollection, GlyphId};
+use crate::{
+    gfx::GeoVertex,
+    tile_source::{TileRect, TileSourceCollection},
+};
+use crate::{
+    style::SourceId,
+    text::{FontCollection, GlyphId},
+};
 
 mod gfx;
+mod mbtiles;
 mod proto {
     include!(concat!(env!("OUT_DIR"), "/vector_tile.rs"));
 }
 mod style;
 mod text;
+mod tile_source;
+mod versatiles;
 
-const TILE_SIZE: u32 = 256;
-//const LINE_WIDTH_SCALE: f32 = 1.0 / TILE_SIZE as f32;
+const TILE_SCALE: f32 = 2.0;
+const TILE_SIZE: f32 = 256.0 * TILE_SCALE;
 
-/// Navigate OSM MBTiles tilesets
+/// Navigate OSM Vector tilesets
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    /// Path to a Mapbox GL style document
-    #[arg(short, long)]
+    /// Path to a MapLibre style document
     style: std::path::PathBuf,
-    /// Path to a MBTiles vector tileset
-    mbtiles: std::path::PathBuf,
 }
 
 fn main() {
@@ -149,7 +150,9 @@ impl ApplicationState {
     ) -> Self {
         let args = Args::parse();
         let style_json = std::fs::File::open(&args.style).unwrap();
-        let style: style::Style = serde_json::from_reader(style_json).unwrap();
+        let style = style::Style::load(style_json).unwrap();
+        let data_dir = args.style.parent().unwrap();
+        let tile_source = TileSourceCollection::load(data_dir, &style).unwrap();
 
         let window = active_event_loop
             .create_window(
@@ -175,7 +178,7 @@ impl ApplicationState {
             },
         );
 
-        let (tile_loader, tile_handle) = TileLoader::new(&args, style, window.gfx());
+        let (tile_loader, tile_handle) = TileLoader::new(tile_source, style, window.gfx());
         let _t = std::thread::Builder::new()
             .name("tile-dispatch".into())
             .spawn({
@@ -315,7 +318,7 @@ impl ApplicationState {
 
                 let zoom_amount = y * 0.25;
                 self.target_zoom += zoom_amount;
-                self.target_zoom = self.target_zoom.max(1.0).min(23.0);
+                self.target_zoom = self.target_zoom.max(0.0).min(23.0);
 
                 self.window.request_redraw();
             }
@@ -577,7 +580,7 @@ impl SlippyMap {
             None
         };
 
-        let in_tiles = if nearest_zoom < 14 && target_zoom > nearest_zoom as f64 {
+        let in_tiles = if nearest_zoom < 23 && target_zoom > nearest_zoom as f64 {
             let mut zoom_in = self.clone();
             zoom_in.camera.zoom += 1.0;
 
@@ -603,10 +606,10 @@ impl SlippyMap {
     fn scale(&self) -> f64 {
         let zoom = self.camera.zoom;
 
-        if zoom < 15.0 {
+        if zoom < 24.0 {
             zoom.fract() + 1.0
         } else {
-            2.0f64.powf(zoom - 14.0)
+            2.0f64.powf(zoom - 23.0)
         }
     }
 
@@ -648,7 +651,7 @@ impl SlippyMap {
     }
 
     fn nearest_zoom(&self) -> u32 {
-        (self.camera.zoom.floor() as u32).min(14).max(0)
+        (self.camera.zoom.floor() as u32).min(23).max(0)
     }
 
     fn pan(&mut self, offset: V2<f64>) {
@@ -678,59 +681,15 @@ impl SlippyMap {
         if factor < 0.0 {
             let offset = offset - (self.window_dims.as_f64() / 2.0);
             self.pan(offset);
-            self.camera.zoom = (self.current_zoom() - factor).max(1.0).min(23.0);
+            self.camera.zoom = (self.current_zoom() - factor).max(0.0).min(23.0);
             self.pan(-offset);
         } else {
-            self.camera.zoom = (self.current_zoom() - factor).max(1.0).min(23.0);
+            self.camera.zoom = (self.current_zoom() - factor).max(0.0).min(23.0);
         }
     }
 
     fn set_zoom(&mut self, zoom: f64) {
         self.camera.zoom = zoom;
-    }
-}
-
-struct MbTilesSource {
-    connection: Connection,
-    decompress_buf: Vec<u8>,
-}
-
-impl MbTilesSource {
-    fn new<P: AsRef<Path>>(database: P) -> Self {
-        let connection = Connection::open_with_flags(
-            database.as_ref(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-
-        Self {
-            connection,
-            decompress_buf: Vec::new(),
-        }
-    }
-
-    fn query_tile(&mut self, tile: TileId) -> Option<Tile> {
-        let mut query = self.connection
-        .prepare_cached(
-            "SELECT tile_data FROM tiles WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3",
-        )
-        .unwrap();
-
-        query
-            .query_row((tile.zoom, tile.column, tile.row), |row| {
-                let compressed_bytes = row.get_ref(0)?.as_blob()?;
-
-                let mut decoder = gzip::Decoder::new(compressed_bytes).unwrap();
-                self.decompress_buf.clear();
-                decoder.read_to_end(&mut self.decompress_buf).unwrap();
-
-                // Changed protobuf def. to use `bytes` instead of `string` for labels, to avoid some non utf-8 data
-                let tile = Tile::decode(self.decompress_buf.as_slice()).unwrap();
-                Ok(tile)
-            })
-            // Should return parent tile if tile not found - mbtiles de-dedupe method when tiles are identical to parent
-            .optional()
-            .unwrap()
     }
 }
 
@@ -770,7 +729,11 @@ struct TileLoader {
 }
 
 impl TileLoader {
-    fn new(args: &Args, style: style::Style, gfx: &gfx::Gfx) -> (Self, TileLoaderHandle) {
+    fn new(
+        tile_source: TileSourceCollection,
+        style: style::Style,
+        gfx: &gfx::Gfx,
+    ) -> (Self, TileLoaderHandle) {
         let mut workers = Vec::new();
 
         let (data_sender, data_receiver) = mpsc::channel();
@@ -781,7 +744,7 @@ impl TileLoader {
         {
             let handle = gfx.handle();
             workers.push(TileWorker::new(
-                args,
+                &tile_source,
                 id,
                 style.clone(),
                 handle,
@@ -832,7 +795,7 @@ struct TileWorker {
 }
 impl TileWorker {
     fn new(
-        args: &Args,
+        tile_source: &TileSourceCollection,
         id: usize,
         style: style::Style,
         gfx: gfx::GfxHandle,
@@ -844,8 +807,8 @@ impl TileWorker {
         let handle = builder
             .name(format!("tesselator-{}", id))
             .spawn({
-                let path = args.mbtiles.clone();
-                move || TileWorker::run(path, style, gfx, data_sender, receiver)
+                let tile_source = tile_source.try_clone().unwrap();
+                move || TileWorker::run(tile_source, style, gfx, data_sender, receiver)
             })
             .expect("unable to spawn worker");
 
@@ -859,39 +822,34 @@ impl TileWorker {
         let _ = self.sender.send(tile_id);
     }
 
-    fn run<P: AsRef<Path>>(
-        db_path: P,
+    fn run(
+        mut tile_source: TileSourceCollection,
         style: style::Style,
         mut gfx: gfx::GfxHandle,
         data_sender: mpsc::Sender<TilePrepare>,
         receiver: mpsc::Receiver<TileId>,
     ) {
-        let mut tile_loader = MbTilesSource::new(db_path.as_ref());
-        let mut tesselator = VectorTileTesselator::new(style, V2::fill(TILE_SIZE).as_f32());
+        let mut tesselator = VectorTileTesselator::new(style, V2::fill(TILE_SIZE));
 
         for tile_id in receiver.iter() {
-            if let Some(tile) = tile_loader.query_tile(tile_id) {
-                tesselator.tesselate_tile(tile_id, &tile);
+            tesselator.tesselate_tile(tile_id, &mut tile_source);
 
-                if gfx.prepare_glyphs(tesselator.labels()) {
-                    let geo = gfx.create_geometry(
-                        tile_id,
-                        tesselator.vertices(),
-                        tesselator.indices(),
-                        tesselator.features().to_vec(),
-                        tesselator.labels(),
-                    );
+            if gfx.prepare_glyphs(tesselator.labels()) {
+                let geo = gfx.create_geometry(
+                    tile_id,
+                    tesselator.vertices(),
+                    tesselator.indices(),
+                    tesselator.features().to_vec(),
+                    tesselator.labels(),
+                );
 
-                    if let Err(_) = data_sender.send(TilePrepare::Ready(geo)) {
-                        break;
-                    }
-                } else {
-                    if let Err(_) = data_sender.send(TilePrepare::PendingGlyphs(tile_id)) {
-                        break;
-                    }
+                if let Err(_) = data_sender.send(TilePrepare::Ready(geo)) {
+                    break;
                 }
             } else {
-                eprintln!("tile not found: {:?}", tile_id);
+                if let Err(_) = data_sender.send(TilePrepare::PendingGlyphs(tile_id)) {
+                    break;
+                }
             }
         }
     }
@@ -907,6 +865,7 @@ pub struct FeatureDraw {
 enum Value<'a> {
     String(&'a bstr::BStr),
     Number(f64),
+    Bool(bool),
 }
 
 impl<'a> Value<'a> {
@@ -914,6 +873,7 @@ impl<'a> Value<'a> {
         match self {
             Value::String(s) => Some(s),
             Value::Number(_) => None,
+            Value::Bool(_) => None,
         }
     }
 }
@@ -923,6 +883,7 @@ impl std::fmt::Display for Value<'_> {
         match self {
             Value::String(s) => s.fmt(f),
             Value::Number(n) => n.fmt(f),
+            Value::Bool(b) => b.fmt(f),
         }
     }
 }
@@ -948,11 +909,7 @@ impl<'a> From<&'a proto::tile::Value> for Value<'a> {
         } else if let Some(n) = value.sint_value {
             Value::Number(n as f64)
         } else if let Some(n) = value.bool_value {
-            if n {
-                Value::Number(1.0)
-            } else {
-                Value::Number(0.0)
-            }
+            Value::Bool(n)
         } else {
             unreachable!()
         }
@@ -964,8 +921,34 @@ pub struct FeatureView<'a> {
     feature: &'a proto::tile::Feature,
 }
 
+static EMPTY_LAYER: proto::tile::Layer = proto::tile::Layer {
+    version: 0,
+    name: String::new(),
+    features: Vec::new(),
+    keys: Vec::new(),
+    values: Vec::new(),
+    extent: None,
+};
+
+static EMPTY_FEATURE: proto::tile::Feature = proto::tile::Feature {
+    id: None,
+    tags: Vec::new(),
+    r#type: None,
+    geometry: Vec::new(),
+};
+
+impl FeatureView<'static> {
+    fn empty() -> Self {
+        FeatureView {
+            layer: &EMPTY_LAYER,
+            feature: &EMPTY_FEATURE,
+        }
+    }
+}
+
 impl<'a> FeatureView<'a> {
-    fn key(&self, key: &str) -> Option<Value<'_>> {
+    fn key<B: AsRef<BStr>>(&self, key: B) -> Option<Value<'_>> {
+        let key = key.as_ref();
         if key == "$type" {
             return Some(match self.shape() {
                 GeomType::Polygon => "Polygon".into(),
@@ -983,7 +966,7 @@ impl<'a> FeatureView<'a> {
                 .layer
                 .keys
                 .get(t_key)
-                .filter(|k| k.as_str() == key)
+                .filter(|k| k.as_slice() == key)
                 .and_then(|_| self.layer.values.get(t_value).map(Value::from));
 
             if key.is_some() {
@@ -1038,7 +1021,7 @@ impl<'a> FeatureLayout<'a> {
         let supported = !self.style.paint.unsupported();
         let visible = self.style.layout.visibility == style::Visibility::Visible;
         let in_zoom = self.style.minzoom.map(|z| self.zoom >= z).unwrap_or(true)
-            && self.style.maxzoom.map(|z| self.zoom < z).unwrap_or(true);
+            && self.style.maxzoom.map(|z| self.zoom <= z).unwrap_or(true);
         let valid_type = match self.kind {
             style::LayerType::Raster => false,
             style::LayerType::FillExtrusion => false,
@@ -1046,7 +1029,7 @@ impl<'a> FeatureLayout<'a> {
         };
 
         let visible =
-            valid_type && supported && visible && in_zoom && self.style.filter.eval(&self.view);
+            valid_type && supported && visible && in_zoom && self.style.filter(&self.view);
 
         visible
     }
@@ -1060,24 +1043,24 @@ impl<'a> FeatureLayout<'a> {
     }
 
     fn text_size(&self) -> f32 {
-        self.style.layout.text_size(self.zoom) * 1.5
+        self.style.layout.text_size(self.view, self.zoom) * TILE_SCALE
     }
 
     fn text_max_width(&self) -> f32 {
-        self.style.layout.text_max_width()
+        self.style.layout.text_max_width() * TILE_SCALE
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FeaturePaint {
     paint: style::Paint,
     kind: style::LayerType,
 }
 
 impl FeaturePaint {
-    pub fn new(style_layer: &style::Layer) -> Self {
+    pub fn new(style_layer: &style::Layer, features: &FeatureView<'_>) -> Self {
         FeaturePaint {
-            paint: style_layer.paint.clone(),
+            paint: style_layer.paint.eval(features),
             kind: style_layer.kind,
         }
     }
@@ -1153,11 +1136,11 @@ impl FeatureStyle {
     }
 
     pub fn line_width(&self) -> f32 {
-        self.line_width
+        self.line_width * TILE_SCALE
     }
 
     pub fn fill_translate(&self) -> V2<f32> {
-        self.fill_translate
+        self.fill_translate * TILE_SCALE
     }
 
     pub fn line_translate(&self) -> V2<f32> {
@@ -1176,11 +1159,63 @@ impl FeatureStyle {
     }
 
     pub fn text_halo_width(&self) -> f32 {
-        self.text_halo_width * 1.5
+        self.text_halo_width * TILE_SCALE
     }
 
     pub fn line_dasharray(&self) -> SmallVec<[f32; 8]> {
         self.line_dasharray.clone()
+    }
+}
+
+struct TileContainer {
+    names: HashMap<String, usize>,
+    tiles: Vec<Option<Option<(Tile, TileRect)>>>,
+}
+
+impl TileContainer {
+    fn new(style: &style::Style) -> Self {
+        let mut names = HashMap::new();
+        let mut tiles = Vec::new();
+
+        for (name, _) in style.sources.iter() {
+            names.insert(name.to_string(), tiles.len());
+            tiles.push(None);
+        }
+
+        Self { names, tiles }
+    }
+
+    fn query_tile<'a>(
+        &'a mut self,
+        tile_source: &mut TileSourceCollection,
+        source_id: &SourceId,
+        tile_id: TileId,
+    ) -> Option<&'a (Tile, TileRect)> {
+        let idx = match source_id {
+            SourceId::Name(n) => *self.names.get(n)?,
+            SourceId::Index(idx) => *idx,
+        };
+
+        let slot = self.tiles.get_mut(idx)?;
+
+        if let Some(tile) = slot {
+            tile.as_ref()
+        } else {
+            let tile = tile_source.query_tile(source_id, tile_id);
+            *slot = Some(tile);
+
+            if let Some(tile) = slot {
+                tile.as_ref()
+            } else {
+                None
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        for tile in self.tiles.iter_mut() {
+            *tile = None;
+        }
     }
 }
 
@@ -1191,10 +1226,10 @@ struct VectorTileTesselator {
     stroke_tessellator: StrokeTessellator,
     stroke_options: StrokeOptions,
     geometry: VertexBuffers<GeoVertex, u32>,
-    feature_draw: Vec<FeatureDraw>,
-    labels: Vec<LayerLabelDraw>,
     tile_dims: V2<f32>,
     fonts: FontCollection,
+    tile_container: TileContainer,
+    draw_commands: DrawCommands,
 }
 
 impl VectorTileTesselator {
@@ -1202,13 +1237,13 @@ impl VectorTileTesselator {
         let fill_options = FillOptions::default().with_tolerance(0.001);
         let fill_tessellator = FillTessellator::new();
         let stroke_options = StrokeOptions::default()
-            .with_tolerance(0.001)
-            .with_line_width(1.0);
+            .with_tolerance(0.0001)
+            .with_line_width(0.01); // These values are very sensitive and can cause very different issues
         let stroke_tessellator = StrokeTessellator::new();
         let geometry: VertexBuffers<GeoVertex, u32> = VertexBuffers::new();
-        let feature_draw = Vec::new();
-        let labels = Vec::new();
         let fonts = FontCollection::new();
+        let tile_container = TileContainer::new(&style);
+        let draw_commands = DrawCommands::new();
 
         VectorTileTesselator {
             style,
@@ -1217,25 +1252,25 @@ impl VectorTileTesselator {
             stroke_tessellator,
             stroke_options,
             geometry,
-            feature_draw,
-            labels,
             tile_dims,
             fonts,
+            tile_container,
+            draw_commands,
         }
     }
 
-    fn tesselate_tile(&mut self, id: TileId, tile: &Tile) -> () {
+    fn tesselate_tile(&mut self, id: TileId, tile_source: &mut TileSourceCollection) -> () {
         let zoom = id.zoom();
 
         self.geometry.vertices.clear();
         self.geometry.indices.clear();
-        self.feature_draw.clear();
-        self.labels.clear();
-        let mut layer_labels: Vec<LabelDraw> = Vec::new();
+        self.tile_container.clear();
+        self.draw_commands.clear();
 
         for style_layer in self.style.layers.iter() {
             if style_layer.kind == style::LayerType::Background {
                 let range_start = self.geometry.indices.len();
+                self.draw_commands.add_draw_cmds(None, range_start);
                 self.geometry
                     .vertices
                     .extend_from_slice(GeoVertex::BACKGROUND_VERTICES);
@@ -1243,105 +1278,93 @@ impl VectorTileTesselator {
                     .indices
                     .extend_from_slice(GeoVertex::BACKGROUND_INDICES);
 
+                let range_end = self.geometry.indices.len();
                 let draw = FeatureDraw {
-                    paint: FeaturePaint::new(style_layer),
-                    elements: range_start..self.geometry.indices.len(),
+                    paint: FeaturePaint::new(style_layer, &FeatureView::empty()),
+                    elements: range_start..range_end,
                 };
 
-                self.feature_draw.push(draw);
+                self.draw_commands.feature_draw.push(draw);
                 continue;
             }
 
-            layer_labels.clear();
+            let Some(target_layer) = style_layer.layer.as_ref() else {
+                continue;
+            };
 
-            for layer in tile.layers.iter() {
-                if !style_layer
-                    .layer
-                    .as_ref()
-                    .map(|l| l.as_str() == layer.name)
-                    .unwrap_or(false)
-                {
+            let Some(source_id) = style_layer.source.as_ref() else {
+                continue;
+            };
+
+            let Some((tile, tile_rect)) =
+                self.tile_container.query_tile(tile_source, source_id, id)
+            else {
+                continue;
+            };
+
+            let Some(layer) = tile.layers.iter().find(|layer| &layer.name == target_layer) else {
+                continue;
+            };
+
+            self.draw_commands.layer_labels.clear();
+            self.draw_commands.draw_range_start = self.geometry.indices.len();
+
+            for feature in layer.features.iter() {
+                let view = FeatureView { layer, feature };
+                let layout = FeatureLayout::new(&view, style_layer, zoom);
+
+                if !layout.visible() {
                     continue;
                 }
 
-                let paint = FeaturePaint::new(&style_layer);
+                let paint = FeaturePaint::new(&style_layer, &view);
                 let style = paint.style(zoom);
 
-                let range_start = self.geometry.indices.len();
+                self.draw_commands
+                    .add_draw_cmds(Some(&paint), self.geometry.indices.len());
 
-                for feature in layer.features.iter() {
-                    let f = FeatureView { layer, feature };
-                    let layout = FeatureLayout::new(&f, style_layer, zoom);
+                self.stroke_options = self
+                    .stroke_options
+                    .with_line_cap(layout.line_cap)
+                    .with_line_join(layout.line_join);
 
-                    if !layout.visible() {
-                        continue;
-                    }
+                match feature.r#type() {
+                    GeomType::Polygon => {
+                        if layout.kind == style::LayerType::Fill {
+                            let polygon =
+                                PolygonIter::new(feature.geometry.iter().copied(), *tile_rect);
 
-                    self.stroke_options = self
-                        .stroke_options
-                        .with_line_cap(layout.line_cap)
-                        .with_line_join(layout.line_join);
-
-                    match feature.r#type() {
-                        GeomType::Polygon => {
-                            if layout.kind == style::LayerType::Fill {
-                                let polygon = PolygonIter::new(feature.geometry.iter().copied());
-
-                                let mut fill_builder = BuffersBuilder::new(
-                                    &mut self.geometry,
-                                    |vertex: FillVertex| GeoVertex {
+                            let mut fill_builder =
+                                BuffersBuilder::new(&mut self.geometry, |vertex: FillVertex| {
+                                    GeoVertex {
                                         position: vertex.position().to_tuple().into(),
                                         normal: V2::fill(0.0),
                                         advancement: 0.0,
                                         fill: gfx::FillMode::Polygon,
-                                    },
-                                );
+                                    }
+                                });
 
-                                let result = self.fill_tessellator.tessellate(
-                                    polygon,
-                                    &self.fill_options,
-                                    &mut fill_builder,
-                                );
+                            let result = self.fill_tessellator.tessellate(
+                                polygon,
+                                &self.fill_options,
+                                &mut fill_builder,
+                            );
 
-                                match result {
-                                    Err(e) => eprintln!("polygon {:?}", e),
-                                    _ => (),
-                                }
-                            }
-
-                            let stroke = match layout.kind {
-                                style::LayerType::Line => true,
-                                style::LayerType::Fill => style.fill_outline_color().is_some(),
-                                _ => false,
-                            };
-
-                            if stroke {
-                                let polygon = PolygonIter::new(feature.geometry.iter().copied());
-
-                                let mut stroke_builder = BuffersBuilder::new(
-                                    &mut self.geometry,
-                                    |vertex: StrokeVertex| GeoVertex {
-                                        position: vertex.position_on_path().to_tuple().into(),
-                                        normal: vertex.normal().to_tuple().into(),
-                                        advancement: vertex.advancement(),
-                                        fill: gfx::FillMode::Line,
-                                    },
-                                );
-
-                                let result = self.stroke_tessellator.tessellate(
-                                    polygon,
-                                    &self.stroke_options,
-                                    &mut stroke_builder,
-                                );
-
-                                match result {
-                                    Err(e) => eprintln!("polygon stroke {:?}", e),
-                                    _ => (),
-                                }
+                            match result {
+                                Err(e) => eprintln!("polygon {:?}", e),
+                                _ => (),
                             }
                         }
-                        GeomType::Linestring if layout.kind == style::LayerType::Line => {
-                            let polygon = LineStringIter::new(feature.geometry.iter().copied());
+
+                        let stroke = match layout.kind {
+                            style::LayerType::Line => true,
+                            style::LayerType::Fill => style.fill_outline_color().is_some(),
+                            _ => false,
+                        };
+
+                        if stroke {
+                            let polygon =
+                                PolygonIter::new(feature.geometry.iter().copied(), *tile_rect);
 
                             let mut stroke_builder =
                                 BuffersBuilder::new(&mut self.geometry, |vertex: StrokeVertex| {
@@ -1360,161 +1383,170 @@ impl VectorTileTesselator {
                             );
 
                             match result {
-                                Err(e) => eprintln!("line string {:?}", e),
+                                Err(e) => eprintln!("polygon stroke {:?}", e),
                                 _ => (),
                             }
                         }
-                        GeomType::Point => {
-                            if layout.kind == style::LayerType::Symbol {
-                                if let Some(text) = layout.text() {
-                                    let (font_id, font) = self.fonts.font(layout.text_font());
-                                    let font_size = layout.text_size();
-                                    let max_text_width = layout.text_max_width() * font_size;
-                                    let v_advance = font
-                                        .horizontal_line_metrics(font_size)
-                                        .map(|m| m.new_line_size)
-                                        .unwrap_or_default();
-                                    let mut h_offset = 0.0;
-                                    let mut v_offset = 0.0;
-                                    let mut glyphs = SmallVec::new();
-                                    let mut lines: SmallVec<[LineDraw; 3]> = SmallVec::new();
-                                    let mut widest_line: f32 = 0.0;
+                    }
+                    GeomType::Linestring if layout.kind == style::LayerType::Line => {
+                        let polygon =
+                            LineStringIter::new(feature.geometry.iter().copied(), *tile_rect);
 
-                                    let mut bounds_min = V2::fill(f32::MAX);
-                                    let mut bounds_max = V2::fill(f32::MIN);
+                        let mut stroke_builder =
+                            BuffersBuilder::new(&mut self.geometry, |vertex: StrokeVertex| {
+                                GeoVertex {
+                                    position: vertex.position_on_path().to_tuple().into(),
+                                    normal: vertex.normal().to_tuple().into(),
+                                    advancement: vertex.advancement(),
+                                    fill: gfx::FillMode::Line,
+                                }
+                            });
 
-                                    let mut last_glyph = None;
+                        let result = self.stroke_tessellator.tessellate(
+                            polygon,
+                            &self.stroke_options,
+                            &mut stroke_builder,
+                        );
 
-                                    for (idx, c) in text.chars().enumerate() {
-                                        if ((h_offset > max_text_width && c == ' ') || c == '\n')
-                                            && text.len() > idx + 2
-                                        {
-                                            widest_line = widest_line.max(h_offset);
-                                            let line = LineDraw {
-                                                width: h_offset,
-                                                glyphs: glyphs.clone(),
-                                            };
-                                            lines.push(line);
-                                            glyphs.clear();
-                                            last_glyph = None;
-                                            h_offset = 0.0;
-                                            v_offset -= v_advance;
-                                            continue;
-                                        }
+                        match result {
+                            Err(e) => eprintln!("line string {:?}", e),
+                            _ => (),
+                        }
+                    }
+                    GeomType::Point => {
+                        if layout.kind == style::LayerType::Symbol {
+                            if let Some(text) = layout.text() {
+                                let (font_id, font) = self.fonts.font(layout.text_font());
+                                let font_size = layout.text_size();
+                                let max_text_width = layout.text_max_width() * font_size;
+                                let v_advance = font
+                                    .horizontal_line_metrics(font_size)
+                                    .map(|m| m.new_line_size)
+                                    .unwrap_or_default();
+                                let mut h_offset = 0.0;
+                                let mut v_offset = 0.0;
+                                let mut glyphs = SmallVec::new();
+                                let mut lines: SmallVec<[LineDraw; 3]> = SmallVec::new();
+                                let mut widest_line: f32 = 0.0;
 
-                                        if c.is_control() {
-                                            last_glyph = None;
-                                            continue;
-                                        }
+                                let mut bounds_min = V2::fill(f32::MAX);
+                                let mut bounds_max = V2::fill(f32::MIN);
 
-                                        if font.lookup_glyph_index(c) == 0 {
-                                            last_glyph = None;
-                                            continue;
-                                        }
+                                let mut last_glyph = None;
 
-                                        let kern = last_glyph
-                                            .and_then(|g| font.horizontal_kern(g, c, font_size))
-                                            .unwrap_or_default();
-
-                                        last_glyph = Some(c);
-
-                                        let metrics = font.metrics(c, font_size);
-
-                                        let min = V2::new(metrics.xmin, metrics.ymin).as_f32()
-                                            + V2::new(h_offset + kern, v_offset);
-                                        let dims = V2::new(metrics.width, metrics.height).as_f32();
-
-                                        let bounds = Rect::new(min, min + dims);
-                                        let glyph_id = GlyphId(font_id, c);
-
-                                        bounds_min = bounds_min.min(bounds.min).min(bounds.max);
-                                        bounds_max = bounds_max.max(bounds.max).max(bounds.min);
-
-                                        if !c.is_whitespace() {
-                                            glyphs.push(GlyphDraw {
-                                                bounds,
-                                                glyph: glyph_id,
-                                            });
-                                        }
-
-                                        h_offset += metrics.advance_width;
-                                    }
-
-                                    let points = PointIter::new(feature.geometry.iter().copied());
-
-                                    if glyphs.len() > 0 {
+                                for (idx, c) in text.chars().enumerate() {
+                                    if ((h_offset > max_text_width && c == ' ') || c == '\n')
+                                        && text.len() > idx + 2
+                                    {
                                         widest_line = widest_line.max(h_offset);
                                         let line = LineDraw {
                                             width: h_offset,
-                                            glyphs,
+                                            glyphs: glyphs.clone(),
                                         };
                                         lines.push(line);
+                                        glyphs.clear();
+                                        last_glyph = None;
+                                        h_offset = 0.0;
+                                        v_offset -= v_advance;
+                                        continue;
                                     }
 
-                                    if lines.len() > 0 {
-                                        if lines.len() > 1 {
-                                            for line in lines.iter_mut() {
-                                                let adj_width = (widest_line - line.width) / 2.0;
-                                                for glyph in line.glyphs.iter_mut() {
-                                                    glyph.bounds.min.x += adj_width;
-                                                    glyph.bounds.max.x += adj_width;
-                                                }
+                                    if c.is_control() {
+                                        last_glyph = None;
+                                        continue;
+                                    }
+
+                                    if font.lookup_glyph_index(c) == 0 {
+                                        last_glyph = None;
+                                        continue;
+                                    }
+
+                                    let kern = last_glyph
+                                        .and_then(|g| font.horizontal_kern(g, c, font_size))
+                                        .unwrap_or_default();
+
+                                    last_glyph = Some(c);
+
+                                    let metrics = font.metrics(c, font_size);
+
+                                    let min = V2::new(metrics.xmin, metrics.ymin).as_f32()
+                                        + V2::new(h_offset + kern, v_offset);
+                                    let dims = V2::new(metrics.width, metrics.height).as_f32();
+
+                                    let bounds = Rect::new(min, min + dims);
+                                    let glyph_id = GlyphId(font_id, c);
+
+                                    bounds_min = bounds_min.min(bounds.min).min(bounds.max);
+                                    bounds_max = bounds_max.max(bounds.max).max(bounds.min);
+
+                                    if !c.is_whitespace() {
+                                        glyphs.push(GlyphDraw {
+                                            bounds,
+                                            glyph: glyph_id,
+                                        });
+                                    }
+
+                                    h_offset += metrics.advance_width;
+                                }
+
+                                let points =
+                                    PointIter::new(feature.geometry.iter().copied(), *tile_rect);
+
+                                if glyphs.len() > 0 {
+                                    widest_line = widest_line.max(h_offset);
+                                    let line = LineDraw {
+                                        width: h_offset,
+                                        glyphs,
+                                    };
+                                    lines.push(line);
+                                }
+
+                                if lines.len() > 0 {
+                                    if lines.len() > 1 {
+                                        for line in lines.iter_mut() {
+                                            let adj_width = (widest_line - line.width) / 2.0;
+                                            for glyph in line.glyphs.iter_mut() {
+                                                glyph.bounds.min.x += adj_width;
+                                                glyph.bounds.max.x += adj_width;
                                             }
                                         }
+                                    }
 
-                                        let bounds = Rect::new(bounds_min, bounds_max);
+                                    let bounds = Rect::new(bounds_min, bounds_max);
 
-                                        for point in points {
-                                            if point.x > 1.0
-                                                || point.y > 1.0
-                                                || point.x < 0.0
-                                                || point.y < 0.0
-                                            {
-                                                continue;
-                                            }
-
-                                            let label = LabelDraw {
-                                                text_size: layout.text_size(),
-                                                offset: point,
-                                                bounds,
-                                                lines: lines.clone(),
-                                            };
-
-                                            layer_labels.push(label);
+                                    for point in points {
+                                        if point.x > 1.0
+                                            || point.y > 1.0
+                                            || point.x < 0.0
+                                            || point.y < 0.0
+                                        {
+                                            continue;
                                         }
+
+                                        let label = LabelDraw {
+                                            text_size: layout.text_size(),
+                                            offset: point,
+                                            bounds,
+                                            lines: lines.clone(),
+                                        };
+
+                                        self.draw_commands.layer_labels.push(label);
                                     }
                                 }
                             }
                         }
-                        _ => {}
                     }
-                }
-
-                let range_end = self.geometry.indices.len();
-
-                if layer_labels.len() > 0 {
-                    let draw = LayerLabelDraw {
-                        paint: paint.clone(),
-                        labels: layer_labels.clone(),
-                    };
-
-                    self.labels.push(draw);
-                }
-
-                if range_end > range_start {
-                    let draw = FeatureDraw {
-                        paint,
-                        elements: range_start..self.geometry.indices.len(),
-                    };
-
-                    self.feature_draw.push(draw);
+                    _ => {}
                 }
             }
+
+            self.draw_commands
+                .add_draw_cmds(None, self.geometry.indices.len());
         }
     }
 
     fn features(&self) -> &[FeatureDraw] {
-        self.feature_draw.as_slice()
+        self.draw_commands.feature_draw.as_slice()
     }
 
     fn vertices(&self) -> &[GeoVertex] {
@@ -1526,7 +1558,65 @@ impl VectorTileTesselator {
     }
 
     fn labels(&self) -> &[LayerLabelDraw] {
-        self.labels.as_slice()
+        self.draw_commands.labels.as_slice()
+    }
+}
+
+struct DrawCommands {
+    feature_draw: Vec<FeatureDraw>,
+    labels: Vec<LayerLabelDraw>,
+    layer_labels: Vec<LabelDraw>,
+    last_paint: Option<FeaturePaint>,
+    draw_range_start: usize,
+}
+
+impl DrawCommands {
+    fn new() -> Self {
+        Self {
+            feature_draw: Vec::new(),
+            labels: Vec::new(),
+            layer_labels: Vec::new(),
+            last_paint: None,
+            draw_range_start: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.feature_draw.clear();
+        self.labels.clear();
+        self.layer_labels.clear();
+        self.draw_range_start = 0;
+        self.last_paint = None;
+    }
+
+    fn add_draw_cmds(&mut self, next_paint: Option<&FeaturePaint>, indices: usize) {
+        if (next_paint.is_none() || next_paint != self.last_paint.as_ref())
+            && let Some(last) = self.last_paint.take()
+        {
+            if self.layer_labels.len() > 0 {
+                let draw = LayerLabelDraw {
+                    paint: last.clone(),
+                    labels: self.layer_labels.clone(),
+                };
+
+                self.layer_labels.clear();
+                self.labels.push(draw);
+            }
+
+            let range_end = indices;
+            if range_end > self.draw_range_start {
+                let draw = FeatureDraw {
+                    paint: last,
+                    elements: self.draw_range_start..range_end,
+                };
+                self.draw_range_start = range_end;
+
+                self.feature_draw.push(draw);
+            }
+            self.last_paint = next_paint.cloned();
+        } else if self.last_paint.is_none() {
+            self.last_paint = next_paint.cloned();
+        }
     }
 }
 
@@ -1573,10 +1663,10 @@ struct PolygonIter<I: Iterator<Item = u32>> {
 }
 
 impl<I: Iterator<Item = u32>> PolygonIter<I> {
-    fn new(inner: I) -> Self {
+    fn new(inner: I, rect: TileRect) -> Self {
         PolygonIter {
             inner: inner.fuse(),
-            cursor: GeoCursor::new(),
+            cursor: GeoCursor::new(rect),
             command: GeoCommand::Unknown,
             count: 0,
             begin: lyon::math::Point::zero(),
@@ -1669,10 +1759,10 @@ struct LineStringIter<I: Iterator<Item = u32>> {
 }
 
 impl<I: Iterator<Item = u32>> LineStringIter<I> {
-    fn new(inner: I) -> Self {
+    fn new(inner: I, rect: TileRect) -> Self {
         LineStringIter {
             inner: inner.fuse(),
-            cursor: GeoCursor::new(),
+            cursor: GeoCursor::new(rect),
             command: GeoCommand::Unknown,
             count: 0,
             begin: lyon::math::Point::zero(),
@@ -1765,10 +1855,10 @@ struct PointIter<I: Iterator<Item = u32>> {
 }
 
 impl<I: Iterator<Item = u32>> PointIter<I> {
-    fn new(inner: I) -> Self {
+    fn new(inner: I, rect: TileRect) -> Self {
         Self {
             inner: inner.fuse(),
-            cursor: GeoCursor::new(),
+            cursor: GeoCursor::new(rect),
             command: GeoCommand::Unknown,
             count: 0,
         }
@@ -1814,11 +1904,12 @@ impl<I: Iterator<Item = u32>> Iterator for PointIter<I> {
 struct GeoCursor {
     x: i64,
     y: i64,
+    rect: TileRect,
 }
 
 impl GeoCursor {
-    fn new() -> Self {
-        GeoCursor { x: 0, y: 0 }
+    fn new(rect: TileRect) -> Self {
+        GeoCursor { x: 0, y: 0, rect }
     }
 
     fn update(&mut self, dx: u32, dy: u32) {
@@ -1833,11 +1924,13 @@ impl GeoCursor {
     }
 
     fn point(&self) -> lyon::math::Point {
-        point(self.x as f32 / 4096.0, self.y as f32 / 4096.0)
+        let p = self.v2();
+        point(p.x, p.y)
     }
 
     fn v2(&self) -> V2<f32> {
-        V2::new(self.x as f32 / 4096.0, self.y as f32 / 4096.0)
+        let p = V2::new(self.x as f32 / 4096.0, self.y as f32 / 4096.0);
+        self.rect.offset(p)
     }
 }
 
@@ -1873,8 +1966,8 @@ impl Color {
     }
 }
 
-impl From<style::Color> for Color {
-    fn from(style: style::Color) -> Self {
+impl From<style::color::Color> for Color {
+    fn from(style: style::color::Color) -> Self {
         let rgba = style.to_rgba();
 
         Color {
@@ -1926,6 +2019,18 @@ impl TileId {
 
     fn is_valid(&self) -> bool {
         self.row < self.limit() && self.column < self.limit()
+    }
+
+    pub fn parent(&self) -> Option<Self> {
+        if self.zoom == 0 {
+            None
+        } else {
+            Some(TileId {
+                zoom: self.zoom - 1,
+                column: self.column / 2,
+                row: self.row / 2,
+            })
+        }
     }
 
     fn zoom(&self) -> f32 {
